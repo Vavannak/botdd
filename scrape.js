@@ -5,7 +5,7 @@ const output_file = 'proxy.txt';
 
 if (fs.existsSync(output_file)) {
   fs.unlinkSync(output_file);
-  console.log(`'${output_file}' telah dihapus🕊🪽.`);
+  console.log(`'${output_file}' scraping proxy for you.`);
 }
 
 const raw_proxy_sites = [
@@ -266,12 +266,12 @@ async function fetchProxies() {
   fs.writeFileSync(output_file, proxies.join('\n'));
   fs.readFile(output_file, 'utf8', (err, data) => {
     if (err) {
-      console.error('Gagal membaca file🕊🪽:', err);
+      console.error('erroe :', err);
       return;
     }
     const proxies = data.trim().split('\n');
     const totalProxies = proxies.length;
-    console.log(`success scraping ${totalProxies} proxy🕊🪽`);
+    console.log(`success scraping ${totalProxies} proxy`);
   });
 }
 fetchProxies();

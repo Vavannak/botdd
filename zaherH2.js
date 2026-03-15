@@ -14,7 +14,7 @@ const net = require("net");
  process.on('uncaughtException', function (exception) {
   });
 
- if (process.argv.length < 7){console.log(gradient.vice(`node URA.js <HOST> <TIME> <RPS> <THREADS> <PROXY>.`));; process.exit();}
+ if (process.argv.length < 7){console.log(gradient.vice(`node zaherH2 <HOST> <TIME> <RPS> <THREADS> <PROXY>.`));; process.exit();}
  const headers = {};
   function readLines(filePath) {
      return fs.readFileSync(filePath, "utf-8").toString().split(/\r?\n/);

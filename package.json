@@ -1,0 +1,42 @@
+{
+  "name": "website",
+  "version": "1.0.0",
+  "description": "",
+  "main": "cfzaher.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vavannak/website.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Vavannak/website/issues"
+  },
+  "homepage": "https://github.com/Vavannak/website#readme",
+  "dependencies": {
+    "axios": "^1.15.0",
+    "better-sqlite3": "^12.9.0",
+    "cheerio": "^1.2.0",
+    "colors": "^1.4.0",
+    "express": "^4.18.2",
+    "express-session": "^1.19.0",
+    "gradient-string": "^3.0.0",
+    "header-generator": "^2.1.82",
+    "moment": "^2.30.1",
+    "multer": "^2.1.1",
+    "node-telegram-bot-api": "^0.67.0",
+    "puppeteer-real-browser": "^1.4.4",
+    "socket.io": "^4.8.3",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^6.0.1",
+    "telegraf": "^4.16.3",
+    "tesseract.js": "^7.0.0",
+    "user-agents": "^2.1.29"
+  }
+}

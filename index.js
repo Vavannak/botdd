@@ -9,8 +9,8 @@ const net = require('net');
 const { scrapeProxies } = require('./proxies.js');
 
 // ---------- HARDCODED CONFIGURATION ----------
-const BOT_TOKEN = 'Enter_BOT_token';        // <--  ផ្លាសប្តូ your bot token
-const OWNER_ID = Enter_chat_id;                     // <-- ផ្លាស់ប្តូ chat id
+const BOT_TOKEN = '8693596953:AAFIBma2cdKeRm1NoIuR7-i2Zp-kiMyyBJs';        // <--  ផ្លាសប្តូ your bot token
+const OWNER_ID = 7780973203;                     // <-- ផ្លាស់ប្តូ chat id
 const SCRIPT_DIR = __dirname;
 const PROXY_DIR = __dirname;
 const METHODS_DIR = path.join(__dirname, 'methods');
